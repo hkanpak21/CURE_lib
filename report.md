@@ -1,179 +1,190 @@
-# CURE Test Repository - Comprehensive Analysis Report
+# Split Training with Homomorphic Encryption
 
-**Date:** December 2024  
-**Repository:** cure_test  
-**Purpose:** Implementation and testing of CURE paper functionalities with Homomorphic Encryption
+This document provides a detailed overview of the `split_training` library, which implements a secure split learning approach for neural networks using homomorphic encryption (HE).
 
-## Executive Summary
+## Overview
 
-The `cure_test` repository is a Go-based project implementing homomorphic encryption (HE) operations for privacy-preserving neural network computations, specifically focused on the CURE research paper. The project uses Lattigo v6.1.1 as its primary HE backend and demonstrates a solid foundation with functional core components, though several areas require completion to achieve the full vision outlined in the project documentation.
+Split learning is a privacy-preserving machine learning technique where a neural network is divided into multiple segments, each trained by different parties without sharing raw data. This implementation uses homomorphic encryption to enhance privacy guarantees by allowing computations on encrypted data.
 
-## Project Structure Analysis
+The library demonstrates training a neural network on the MNIST dataset with the network split between a client and server, where the server processes encrypted inputs and gradients without having access to the actual values.
 
-### Current Repository Layout
+## Architecture
+
+### Neural Network Structure
+
+The neural network consists of 3 layers:
+- **Layer 1** (Server-side): Input → Hidden Layer 1 (784 → 128 neurons)
+- **Layer 2** (Client-side): Hidden Layer 1 → Hidden Layer 2 (128 → 32 neurons)
+- **Layer 3** (Client-side): Hidden Layer 2 → Output (32 → 10 neurons)
+
+### Key Components
+
+The library is organized into several modules, each handling specific aspects of the split learning process:
+
+#### Core Data Structures
+
+- `ClientModel`: Holds the weights and biases for the client-side layers (layers 2 and 3)
+- `ServerModel`: Holds the weights and biases for the server-side layer (layer 1)
+- `HEServerModel`: Encrypted version of the server model
+- `HEServerPacked`: Optimized version of the encrypted server model for SIMD operations
+- `HEContext`: Holds all cryptographic components for homomorphic encryption
+
+#### Parameters
+
+- `InputDim`: Input dimension (784 for MNIST)
+- `HiddenDim1`: First hidden layer dimension (128)
+- `HiddenDim2`: Second hidden layer dimension (32)
+- `OutputDim`: Output dimension (10 for MNIST digit classification)
+- `NeuronsPerCT`: Number of neurons packed per ciphertext (64)
+- `BatchSize`: Mini-batch size for training
+
+#### Training Modes
+
+The library supports two training modes:
+1. **Standard Homomorphic Mode**: Server forward pass is encrypted, but weights are updated after decrypting gradients
+2. **Fully Homomorphic Mode**: Both forward and backward passes are performed homomorphically
+
+## Workflow
+
+### 1. Data Flow in Split Learning
+
 ```
-cure_test/
-├── cmd/                     # [EMPTY] - CLI applications planned but not implemented
-├── pkg/                     # Core library packages
-│   ├── activation_he/       # ✅ HE-based activation functions (COMPLETE)
-│   ├── he/                  # ✅ Core HE operations (PARTIAL)
-│   │   ├── ops/            # ✅ Atomic HE operations
-│   │   └── params/         # ✅ Parameter sets and key generation
-│   ├── layers/             # ⚠️ Neural network layers (MINIMAL)
-│   │   └── conv.go         # Convolutional layer implementation
-│   └── matrix/             # ✅ Matrix operations (COMPLETE)
-├── tests/                   # ✅ Test coverage (GOOD)
-│   ├── he/                 # Comprehensive HE operation tests
-│   └── layers/             # Layer-specific tests
-├── examples/               # ⚠️ Limited examples
-│   └── relu_sigmoid/       # Single demo application
-└── training/               # [EMPTY] - Training logic not implemented
-```
-
-## Technical Implementation Status
-
-### ✅ **Completed Components**
-
-#### 1. Homomorphic Encryption Foundation (`pkg/he/`)
-- **Parameters (`params.go`)**: Well-structured parameter management with:
-  - `DefaultSet`: General-purpose CKKS parameters (LogN=14, complex modulus chain)
-  - `TestSet`: Optimized for testing (LogN=12, 10 levels for degree-7 polynomials)
-  - Placeholders for `Set1` and `Set2` from CURE paper
-- **Operations (`ops.go`)**: Comprehensive HE operations including:
-  - Scalar multiplication with proper error handling
-  - Ciphertext multiplication with relinearization and rescaling
-  - Matrix multiplication with parallel processing support
-  - Matrix power operations for higher-degree computations
-
-#### 2. Activation Functions (`pkg/activation_he/`)
-- **Polynomial Approximations**: Chebyshev polynomial implementations for:
-  - ReLU (degrees 3 and 5) with MSE < 2e-3
-  - Sigmoid (degrees 3 and 5) with excellent accuracy (MSE < 1e-9)
-- **HE Integration**: Full homomorphic evaluation of activation functions
-- **Test Coverage**: Comprehensive tests for both plaintext and ciphertext operations
-
-#### 3. Matrix Operations (`pkg/matrix/`)
-- Basic matrix operations (multiply, add, subtract)
-- Proper dimension validation and error handling
-- Edge case handling for empty matrices
-
-### ⚠️ **Partially Implemented Components**
-
-#### 1. Neural Network Layers (`pkg/layers/`)
-- **Convolution Layer**: Implemented but lacks integration with HE operations
-- **Missing Layers**: Linear, pooling, residual connections not implemented
-- **Interface Design**: No unified interface for plaintext vs. HE tensor operations
-
-#### 2. HE Parameter Sets
-- CURE paper-specific parameter sets (`Set1`, `Set2`) are placeholders
-- Current implementation redirects to `DefaultSet`
-- Security analysis and parameter optimization pending
-
-### ❌ **Missing Components**
-
-#### 1. CLI Applications (`cmd/`)
-- `cure-train`: Plaintext training application
-- `cure-split`: Split-learning training
-- `cure-infer`: Inference and benchmarking tools
-
-#### 2. Training Infrastructure (`training/`)
-- Optimizers, schedulers, loss functions
-- Dataset loaders and augmentations
-- Training orchestration logic
-
-#### 3. Model Management (`pkg/model/`)
-- Graph representation and builder DSL
-- Split-learning utilities
-- ONNX import/export capabilities
-
-## Test Results and Quality Assessment
-
-### Test Coverage Summary
-```
-✅ pkg/activation_he    - PASS (comprehensive HE activation tests)
-✅ pkg/he/backup       - PASS (legacy HE operations)
-✅ pkg/matrix          - PASS (matrix operation validation)
-⚠️ tests/he/          - PARTIAL (some tests may hang on complex operations)
-❌ pkg/he/ops         - NO TESTS (despite implementation)
-❌ pkg/he/params      - NO TESTS (parameter validation missing)
-❌ pkg/layers         - NO TESTS (layer functionality untested)
+Client                          Server
++-------------------------+     +------------------------+
+| 1. Prepare & encrypt    |---->| 2. Forward pass on     |
+|    input data (images)  |     |    encrypted inputs    |
++-------------------------+     +------------------------+
+                                          |
+                                          v
++-------------------------+     +------------------------+
+| 3. Decrypt activations  |<----| Return encrypted       |
+|    Forward through      |     | activations (layer 1)  |
+|    layers 2 & 3         |     +------------------------+
+|    Compute loss         |
+|    Backward pass        |
+|    Update client weights|
++-------------------------+
+          |
+          v
++-------------------------+     +------------------------+
+| 4. Encrypt gradients    |---->| 5. Backward pass &     |
+|    for server layer     |     |    weight updates      |
++-------------------------+     +------------------------+
 ```
 
-### Test Quality Observations
-- **Activation Functions**: Excellent test coverage with MSE validation
-- **HE Operations**: Functional tests exist but some have performance issues
-- **Missing Unit Tests**: Several core packages lack proper test coverage
-- **Integration Tests**: Limited end-to-end workflow testing
+### 2. Homomorphic Encryption Implementation
 
-## Dependency and Build Status
+The library uses the Lattigo library to implement homomorphic encryption with the CKKS scheme:
 
-### Dependencies Analysis
-- **Lattigo v6.1.1**: ✅ Latest stable version, properly integrated
-- **Testify v1.8.0**: ✅ Standard testing framework
-- **Go 1.23.0**: ✅ Modern Go version with latest features
-- **Module Integrity**: ✅ All modules verified, dependencies clean
+- **Encryption Parameters**: Configured for sufficient multiplicative depth (LogN=12, LogQ=[40, 40, 40, 40])
+- **SIMD Operations**: Packing multiple values into a single ciphertext to parallelize operations
+- **Rotation Keys**: Generated to support slot rotations for efficient vector operations
 
-### Build Status
-- **Compilation**: ✅ All packages build without errors
-- **Go Vet**: ✅ No static analysis issues detected
-- **Module Verification**: ✅ All dependencies verified and tidy
+### 3. Optimizations
 
-## Performance and Security Assessment
+The library implements several optimizations to improve performance:
 
-### Strengths
-1. **Robust HE Implementation**: Proper use of Lattigo with relinearization and rescaling
-2. **Parameter Flexibility**: Multiple parameter sets for different use cases
-3. **Error Handling**: Comprehensive error checking throughout HE operations
-4. **Parallel Processing**: Matrix operations support concurrent execution
+- **Parallel Processing**: Multi-threaded operations for forward and backward passes
+- **Neuron Packing**: Multiple neurons are packed into a single ciphertext (NeuronsPerCT = 64)
+- **Batch Packing**: Multiple examples from a batch are processed in parallel
+- **Efficient Slot Rotation**: Optimized rotation operations for summing slots and gradient computation
 
-### Areas of Concern
-1. **Test Performance**: Some HE tests appear to hang or run indefinitely
-2. **Parameter Security**: CURE-specific parameter sets need security analysis
-3. **Memory Management**: Large matrix operations may need optimization
-4. **Scale Management**: Complex operations may accumulate numerical errors
+## Key Functions
 
-## Recommendations
+### Data Handling
 
-### High Priority (Complete for Minimal Viable Product)
-1. **Implement CURE Parameter Sets**: Replace placeholder `Set1` and `Set2` with actual values from the paper
-2. **Add Missing Tests**: Create unit tests for `pkg/he/ops` and `pkg/he/params`
-3. **Fix Test Performance**: Investigate and resolve hanging test issues
-4. **Create Basic CLI**: Implement at least one CLI application (`cure-infer`) for demonstrations
+- `readMNISTData()`: Loads MNIST dataset from files
+- `readMNISTImages()`: Helper to read image data
+- `readMNISTLabels()`: Helper to read label data
 
-### Medium Priority (Enhanced Functionality)
-1. **Complete Layer Implementation**: Add linear, pooling, and activation layers with HE support
-2. **Unified Tensor Interface**: Create interface for seamless plaintext/HE tensor swapping
-3. **Training Infrastructure**: Implement basic training loop and optimizers
-4. **Documentation**: Add comprehensive API documentation and tutorials
+### Model Initialization
 
-### Low Priority (Future Enhancements)
-1. **ONNX Integration**: Model import/export capabilities
-2. **Advanced Optimizations**: Bootstrap operations and advanced rescaling policies
-3. **Benchmarking Suite**: Performance comparison tools
-4. **Split-Learning**: Distributed training capabilities
+- `initHE()`: Initializes homomorphic encryption context
+- `initClientModel()`: Creates and initializes client-side model
+- `initServerModel()`: Creates and initializes server-side model
 
-## Compliance with Project Vision
+### Forward Pass
 
-### Architecture Alignment
-The current implementation aligns well with the proposed architecture in `instructions.md`:
-- ✅ Separation of concerns (HE operations isolated from ML logic)
-- ✅ Public API design suitable for external vendoring
-- ⚠️ Partial implementation of layered architecture
-- ❌ Missing CLI entry points and model management
+- `clientPrepareAndEncryptBatch()`: Encrypts a batch of images
+- `serverForwardPass()`: Performs forward pass on encrypted inputs
+- `clientForwardAndBackward()`: Client-side forward and backward pass
 
-### Migration Status
-The project appears to be in the middle of the proposed migration:
-- Core HE operations have been properly modularized
-- Some components are still in `backup/` directories
-- Import paths follow the intended structure
-- Interface abstractions are partially implemented
+### Backward Pass and Weight Updates
+
+- `serverBackwardAndUpdate()`: Updates server weights homomorphically
+- `packedUpdate()`: Updates weights using packed ciphertexts for SIMD operations
+- `innerSumSlots()`: Sums values across slots in a ciphertext
+- `chunkSum()`: Reduces slots belonging to each neuron
+
+### Model Evaluation
+
+- `evaluateModel()`: Evaluates model accuracy on test data
+- `clientEvaluateForwardPass()`: Client-side forward pass for evaluation
+
+### Utility Functions
+
+- `convertToPacked()`: Converts a server model to a packed homomorphic version
+- `scalarPlain()`: Encodes a constant replicated in every slot
+- `maskFirst()`: Creates a mask to keep only the first slot in each chunk
+- `repeat()`: Creates a repeated value array
+
+## Homomorphic Encryption Techniques
+
+### 1. Encrypted Matrix-Vector Multiplication
+
+The server performs matrix-vector multiplication on encrypted inputs:
+
+```
+encZ1[i] = bias[i] + Σ(encInput[j] * W1[j][i]) for j=0 to inputDim-1
+```
+
+### 2. Encrypted ReLU Approximation
+
+ReLU activation is approximated using Chebyshev polynomials:
+
+```
+ReLU(x) ≈ 0.32 + 0.5*x + 0.23*x²
+```
+
+### 3. Encrypted Gradient Computation
+
+Gradients are computed and packed efficiently:
+
+```
+encGradBlk[b] = pack(dA1_Transposed[b*NeuronsPerCT:(b+1)*NeuronsPerCT])
+```
+
+### 4. Homomorphic Weight Updates
+
+Weights are updated fully homomorphically:
+
+```
+W ← W + η * (X ⊙ gradients)
+```
+
+where η is the learning rate and ⊙ represents element-wise multiplication.
+
+## Security Considerations
+
+- **Data Privacy**: Raw data never leaves the client
+- **Model Privacy**: Server model weights can be kept encrypted during training
+- **Gradient Privacy**: Gradients are encrypted during transmission
+- **Threat Model**: Protects against honest-but-curious adversaries
+
+## Performance Considerations
+
+- **Computational Overhead**: Homomorphic operations are computationally intensive
+- **Memory Usage**: Ciphertexts require significantly more memory than plaintexts
+- **Trade-offs**: The library balances security with performance through SIMD optimizations
+
+## Limitations
+
+- Approximate activation functions are used instead of exact ReLU
+- Limited multiplicative depth restricts network complexity
+- Performance is significantly slower than plaintext training
 
 ## Conclusion
 
-The `cure_test` repository demonstrates a solid foundation for homomorphic encryption-based neural network operations. The core HE functionality is well-implemented and tested, with particular strength in activation function approximations and basic operations. However, the project requires completion of several key components to achieve its full potential as outlined in the project documentation.
+The `split_training` library demonstrates how homomorphic encryption can be used to implement privacy-preserving split learning. By keeping data encrypted during computation, it provides strong privacy guarantees while still allowing effective model training.
 
-The codebase is well-structured, follows Go best practices, and uses appropriate dependencies. With focused effort on the high-priority recommendations, this project could serve as a robust platform for privacy-preserving machine learning research and applications.
-
-**Overall Status**: 🟡 **Partial Implementation** - Core functionality complete, ecosystem components pending
-
-**Recommended Next Steps**: Focus on implementing CURE-specific parameters, adding comprehensive tests, and creating at least one functional CLI application to demonstrate the system's capabilities.
+The implementation showcases practical techniques for working with homomorphic encryption in machine learning, including SIMD operations, parallel processing, and efficient algorithms for common neural network operations. 
