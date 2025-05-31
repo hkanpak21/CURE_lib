@@ -208,7 +208,8 @@ func trainBatchWithTiming(heContext *HEContext, clientModel *ClientModel, server
 
 	// Phase 4: Server-Side Homomorphic Backward Pass & Update
 	serverBackStart := time.Now()
-	err = serverBackwardAndUpdate(heContext, serverModel, encGradients, learningRate)
+	// Pass the cached encInputs to serverBackwardAndUpdate for accurate weight updates
+	err = serverBackwardAndUpdate(heContext, serverModel, encGradients, encInputs, learningRate)
 	serverBackTime := time.Since(serverBackStart)
 	if trackMetrics {
 		metrics.totalServerBackwardTime += serverBackTime
@@ -250,6 +251,7 @@ func trainBatchFullHomomorphic(heContext *HEContext, clientModel *ClientModel, s
 	}
 
 	// 4. Server: Fully homomorphic backward pass and weight update using packed SIMD
+	// We'll use packedUpdate directly instead of going through serverBackwardAndUpdate
 	err = packedUpdate(heContext, heServer, encInputs, encGradBlk,
 		learningRate, len(batchIndices))
 	if err != nil {
@@ -257,7 +259,7 @@ func trainBatchFullHomomorphic(heContext *HEContext, clientModel *ClientModel, s
 	}
 
 	// 5. Convert updated homomorphic model back to standard model
-	// For demonstration, we decrypt the weights and update the standard model
+	// For demonstration, decrypt the weights and update the standard model
 	// In a real fully homomorphic system, we would keep the weights encrypted
 	blk := HiddenDim1 / NeuronsPerCT
 	for i := 0; i < InputDim; i++ {

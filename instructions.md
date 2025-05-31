@@ -1,153 +1,84 @@
-## Proposed repository layout
+Below is a two-part review:
 
-```
-cure/
-│
-├── cmd/                        # CLI entry points
-│   ├── cure-train/             # plaintext training
-│   ├── cure-split/             # split-learning training
-│   └── cure-infer/             # inference / benchmarking
-│
-├── internal/                   # helper code, not exported
-│   ├── parallel/               # worker-pool, goroutine utils
-│   └── math/                   # padding, index maps, misc numerics
-│
-├── pkg/
-│   ├── he/                     # LOW-LEVEL homomorphic toolkit
-│   │   ├── params/             # CURE-S / M / L parameter sets, keygen
-│   │   ├── ops/                # atomic ops: dot, matmul, conv, pool
-│   │   ├── rescale/            # scale manager & policies
-│   │   └── boot/               # bootstrap wrapper
-│   │
-│   ├── layers/                 # DL layers (plain + HE variants)
-│   │   ├── linear.go
-│   │   ├── conv.go
-│   │   ├── pool.go
-│   │   ├── activation.go
-│   │   └── residual.go
-│   │
-│   ├── model/                  # graph, builder DSL, splitter
-│   │   ├── graph.go
-│   │   ├── builder.go
-│   │   └── onnx.go             # (future) import / export helpers
-│   │
-│   ├── train/                  # optimisers, schedulers, losses
-│   └── data/                   # dataset loaders, augmentations
-│
-├── tests/                      # go test packages live here
-│   ├── he/
-│   ├── layers/
-│   ├── integration/
-│   └── benchmarks/
-│
-├── examples/                   # tiny runnable demos
-│   ├── mlp_plain.go
-│   ├── resnet_split.go
-│   └── gan_generate.go
-│
-├── scripts/                    # helper bash / python scripts
-│
-├── docs/
-│   ├── ARCHITECTURE.md         # packing layout, scale flow
-│   ├── PARAMS.md               # security & modulus chains
-│   └── CONTRIB.md              # coding style, PR checklist
-│
-└── go.mod
-```
-
-### Rationale
-
-| Folder       | Responsibility                                                                                       | Why it matters |
-| ------------ | ---------------------------------------------------------------------------------------------------- | -------------- |
-| `pkg/he`     | *Pure CKKS primitives* only.<br>Easy to vendor into other projects without dragging ML code.         |                |
-| `pkg/layers` | Wraps `he` ops **and** their plaintext twins, so you keep one API regardless of deployment back-end. |                |
-| `pkg/model`  | Graph engine, builder DSL, split-learning utilities.  Keeps layer code free from graph concerns.     |                |
-| `internal`   | Small helpers you don’t want in the public API; Go will enforce the boundary.                        |                |
-| `cmd`        | CLI binaries live here; each directory is a `package main`.                                          |                |
-| `tests`      | Test-only packages avoid import cycles and keep benchmarking tidy.                                   |                |
-| `docs`       | Central place for design notes and parameter tables—stops PDF drift.                                 |                |
+* **(A) Reality check – where the code genuinely works over CKKS ciphertexts and where it silently falls back to dummy/plaintext logic.**
+* **(B) Concrete optimisations you can apply right away (packing schemes, evaluator tricks, goroutines, memory reuse).**
 
 ---
 
-## Migration plan (high-level)
+## A.  Does the current code really “stay encrypted”?
 
-1. **Create new modules**
+| Component                               | Genuine HE?    | What actually happens                                                                                                                                                             | Why it matters                                                                                             |
+| --------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **`clientPrepareAndEncryptBatch`**      | ✅              | Each input pixel is encoded in its own ciphertext (one row → one CT).                                                                                                             | Works but wastes 4 096 slots per ciphertext and 784 encryptions per image-batch.                           |
+| **`serverForwardPass`**                 | ⚠️ half-true   | Performs CT × PT multiplies **inside triple-nested loops**. Every `(inputDim × hiddenDim1)` weight is re-encoded into a plaintext on every batch.                                 | Correct but extremely slow; no SIMD across weights or inputs, huge garbage collection pressure.            |
+| **ReLU approximation**                  | ✅ (but costly) | Computes degree-2 Chebyshev polynomial homomorphically. Constant term (0.32) is re-encoded & re-encrypted per neuron.                                                             | Functional; avoid re-encrypting constants.                                                                 |
+| **`clientForwardAndBackward`**          | ✅/🛑           | Decrypts first-layer activations ⇒ does **all** remaining forward, loss, and back-prop in plaintext. Only `dA1ᵀ` is re-packed and re-encrypted (2 ciphertexts).                   | Fine if your threat model accepts the client seeing activations; otherwise you leak intermediate features. |
+| **`serverBackwardAndUpdate`**           | 🛑 dummy       | Re-creates “all-ones” encrypted inputs instead of the *real* `encInputs` (comment even says so). Updates therefore do **not** use the real data – weight updates are meaningless. |                                                                                                            |
+| **`serverBackwardAndUpdateHEParallel`** | ✅              | Correct CT × CT/CT × PT maths and parallelism, but **never called** from training path.                                                                                           |                                                                                                            |
+| **`packedUpdate` (fully-HE branch)**    | ✅              | Real SIMD weight update, but relies on the client-side packed gradients and **needs real encInputs**; in `trainBatchFullHomomorphic` you pass the true ones – good.               |                                                                                                            |
+| **Model conversion helpers**            | ✅              | Encrypt weights/biases once, but still replicate scalar into every slot (inefficient packing).                                                                                    |                                                                                                            |
 
-   ```bash
-   mkdir -p pkg/he/ops pkg/he/params pkg/layers pkg/model internal/parallel
-   ```
-2. **Move files**
+**Bottom line**
 
-   * `pkg/he/ops.go`      → `pkg/he/ops/ops.go`
-   * `pkg/he/conv.go`     → `pkg/layers/conv.go`
-   * tests under `*_test.go` follow their code.  Update import paths.
-3. **Split package names**
-
-   * `package he` (for low-level)
-   * `package layers` (depends on `he`)
-   * `package model` (depends on `layers`)
-4. **Introduce interfaces**
-
-   ```go
-   type Cipher interface { Add(Cipher) Cipher; Mul(Cipher) Cipher }
-   ```
-
-   so layer code can swap **plaintext** and **homomorphic** tensors.
-5. **CI smoke test** — run `go test ./...` after each batch move.
+* The “standard” training path (`trainBatchWithTiming → serverBackwardAndUpdate`) does **not** learn – gradients are computed, but server updates use dummy encrypted vectors.
+* The “fullyHomomorphic” path is logically correct but still far from optimal (784 CTs per image, no slot rotations, repeated encoding).
 
 ---
 
-## `REPO_LAYOUT.md` (sample)
+## B.  Optimisations & clean-ups
 
-```markdown
-# Repository layout (v2)
+### 1.  Packing & SIMD
 
-``cure`` follows a “top–down” hierarchy:
+| Issue                                              | Fix                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **784 ciphertexts for every image**                | Pack an *entire image* (or even several images) into **one** ciphertext:<br/>`go<br/>vec := make([]float64, he.params.N()/2)<br/>copy(vec, imgs[idx[j]])  // 784 values<br/>encoder.EncodeNTT(vec, pt)  // then pad zeros<br/>`<br/>Dot-product with a row of `W1` can then be done with **rotations + accumulations**: pre-encode the weight row once, rotate the input CT, multiply & add. |
+| **Weights encoded as “same scalar in every slot”** | Encode each **64-neuron chunk** exactly once and reuse:<br/>*For forward* – rotate the input CT while keeping the packed-weights CT fixed.<br/>*For back-prop* – you already pack `dA1` correctly; do the same for inputs.                                                                                                                                                                   |
+| **Constant plaintexts re-created every time**      | Pre-compute:<br/>`go<br/>ptConst032 := encoder.EncodeNew(repeat(0.32, slots))<br/>ptConst05  := encoder.EncodeNew(repeat(0.5 , slots))<br/>ptConst023 := encoder.EncodeNew(repeat(0.23, slots))<br/>`                                                                                                                                                                                        |
+| **`MulNew(ct, 0.5)` – implicit encoding**          | Explicitly use the cached plaintext; avoids a runtime reflect/allocation path in Lattigo.                                                                                                                                                                                                                                                                                                    |
+| **Bias update**                                    | Store each bias vector as **one slot per neuron** (no batching) and use a mask+rotation strategy identical to weights – you cut ciphertext count in half.                                                                                                                                                                                                                                    |
 
-```
+### 2.  Parallelism
 
-cmd/            – CLI binaries (train / infer / split)
-pkg/
-he/           – low–level CKKS primitives, no DL logic
-layers/       – Conv, Linear, Pool … implemented for
-both plaintext and homomorphic tensors
-model/        – graph builder, splitter, ONNX I/O
-internal/       – non-exported helpers (parallelism, math)
-tests/          – all unit, fuzz and benchmark packages
-examples/       – small runnable demos
-docs/           – design notes, parameter tables, tutorials
+| Hot section                                   | Suggested scheme                                                                                                                                                                                                                                                                                                  |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Forward dot-product** (`serverForwardPass`) | Spawn `NumWorkers` goroutines over **output neurons**. Each goroutine:<br/>1. Begins with its CT = bias.<br/>2. Iterates *row-wise* through packed weight blocks, doing CT × PT; accumulate locally.<br/>Avoids lock contention; evaluator is thread-safe if you clone it (`eval := he.evaluator.ShallowCopy()`). |
+| **ReLU loop**                                 | Already parallel; just move the constant-CT creation *outside* the worker to avoid races.                                                                                                                                                                                                                         |
+| **`packedUpdate`**                            | Good; may raise `NumWorkers` to use all cores. Keep one evaluator per goroutine.                                                                                                                                                                                                                                  |
 
-````
+### 3.  Ciphertext-level tricks
 
-### Import rules
+* **Lazy rescale & modulus switching** – With degree-2 polynomials you need at most two rescale steps. Batch the `Mul` and `Add` calls, then call `Evaluator.Rescale` once per neuron to save three NTTs.
+* **Relinearisation** – Only needed for CT × CT (square in ReLU, CT × CT in weight update). Store a `sharingKey` and call `Relinearize` *after* the per-slot sum to reduce ciphertext size earlier.
+* **`innerSumSlots` / `chunkSum`** – If you use “one image per CT” packing, switch to Lattigo’s `Evaluator.InnerSumLog` to get an O(log B) tree instead of linear rotations.
 
-* `pkg/he/**` **MUST NOT** import anything outside `pkg/he`.
-* `pkg/layers` may import `pkg/he` but never vice-versa.
-* CLI (`cmd/*`) may import anything under `pkg/…` but nothing under `internal/`.
+### 4.  Memory & GC
 
-### How to add a new HE op
+* Re-use the `line := make([]float64, slots)` scratch buffer – put it in a `sync.Pool`.
+* Pre-allocate `encZ1` and `encA1` once per epoch; re-encrypt only what changes.
+* Avoid `make([]float64,B)` inside the innermost loops; reuse.
 
-1. Put the core math in `pkg/he/ops`.
-2. Wire it into a layer wrapper in `pkg/layers`.
-3. Add unit test under `tests/he/` and (optionally) a benchmark.
+### 5.  API / Logic corrections
 
-### Build & test
-
-```bash
-go test ./...
-go vet ./...
-golangci-lint run
-````
+1. **Pass real `encInputs` to `serverBackwardAndUpdate`** – cache them after the forward pass (or re-encrypt from client if memory is tight).
+2. **Remove the “all-ones placeholders”** – they make gradients meaningless.
+3. **Call `serverBackwardAndUpdateHEParallel`** in the standard path when not using packed SIMD.
+4. **Document threat model** – decrypting `encActivations` on the client is OK only if feature leakage is acceptable.
 
 ---
 
-With this structure you gain:
+## Quick win checklist
 
-* **Clear public API surface** (`pkg/...`)
-* **Separation of concerns** (math vs. DL vs. CLI)
-* **Easy vendoring** of `pkg/he` by outside users
-* **Scalable testing** (benchmarks isolated in `tests/benchmarks`)
+* [ ] Cache plaintext weights (`ptWeightRow`) once per epoch.
+* [ ] Replace `mulNew(ct, 0.5)` by `mul(ct, ptConst05, …)`.
+* [ ] Pre-generate constant plaintexts outside loops.
+* [ ] Pass **real** encrypted inputs to weight update.
+* [ ] Switch to *image-per-ciphertext* packing and rotation-based dot-product – biggest speed-up.
+* [ ] Use `Evaluator.InnerSumLog` or `InnerSum` for bias/gradient reductions.
+* [ ] Spawn goroutines over output neurons in `serverForwardPass`.
 
-Start the refactor *before* adding ResNet code—you’ll thank yourself later.
+Apply the above and you should see:
 
-[1]: https://github.com/hkanpak21/cure_test "GitHub - hkanpak21/cure_test"
+* **>10× fewer ciphertexts** in memory,
+* **2-3× speed-up** from packing and constant reuse,
+* smoother scaling with CPU cores,
+* and – most importantly – **correct weight updates** in the “standard” training mode.

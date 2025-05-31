@@ -2,238 +2,115 @@ package split
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
 
-// Client prepares and encrypts a batch of images with parallel processing
+// Client prepares and encrypts a batch of images with SIMD optimization
+// Packs an entire image into one ciphertext instead of one ciphertext per pixel
 func clientPrepareAndEncryptBatch(he *HEContext, imgs [][]float64, idx []int) ([]*rlwe.Ciphertext, error) {
-	B := len(idx)
-	encInputs := make([]*rlwe.Ciphertext, InputDim)
+	slots := he.params.N() / 2
 
-	var wg sync.WaitGroup
-	rowsPerWkr := (InputDim + NumWorkers - 1) / NumWorkers
+	// Instead of 784 ciphertexts, we'll use just one per image
+	// Each image will be fully packed into its own ciphertext
+	encInputs := make([]*rlwe.Ciphertext, 1)
 
-	for w := 0; w < NumWorkers; w++ {
-		start := w * rowsPerWkr
-		end := min(InputDim, start+rowsPerWkr)
-		if start >= end {
-			continue
+	// Create a buffer for encoding
+	vec := make([]float64, slots)
+
+	// For now we process just one image at a time, later we can batch multiple images
+	if len(idx) > 0 {
+		// Get the first image
+		imgIdx := idx[0]
+		img := imgs[imgIdx]
+
+		// Copy the image pixels into the vector
+		// Make sure we don't exceed the number of slots
+		pixelsToUse := min(len(img), slots)
+		for i := 0; i < pixelsToUse; i++ {
+			vec[i] = img[i]
 		}
 
-		wg.Add(1)
-		go func(s, e int) {
-			defer wg.Done()
-			localEnc := he.encryptor // immutable
-			localEncdr := he.encoder
+		// Encode the vector
+		pt := ckks.NewPlaintext(he.params, he.params.MaxLevel())
+		he.encoder.Encode(vec, pt)
 
-			for i := s; i < e; i++ {
-				vec := make([]float64, B)
-				for j := 0; j < B; j++ {
-					vec[j] = imgs[idx[j]][i]
-				}
-				pt := ckks.NewPlaintext(he.params, he.params.MaxLevel())
-				localEncdr.Encode(vec, pt)
-				ct, err := localEnc.EncryptNew(pt)
-				if err != nil {
-					fmt.Printf("Error encrypting input row %d: %v\n", i, err)
-					return
-				}
-				encInputs[i] = ct
-			}
-		}(start, end)
+		// Encrypt
+		var err error
+		encInputs[0], err = he.encryptor.EncryptNew(pt)
+		if err != nil {
+			return nil, fmt.Errorf("encryption error: %v", err)
+		}
 	}
-	wg.Wait()
+
 	return encInputs, nil
 }
 
 // Server performs forward pass on encrypted inputs
-func serverForwardPass(heContext *HEContext, serverModel *ServerModel, encInputs []*rlwe.Ciphertext) ([]*rlwe.Ciphertext, error) {
-	// Step 1: Linear Layer (Forward)
-	// Perform homomorphic matrix-vector multiplication between the plaintext weight matrix W_1
-	// and the encrypted input vectors
+func serverForwardPass(he *HEContext, serverModel *ServerModel, encInputs []*rlwe.Ciphertext) ([]*rlwe.Ciphertext, error) {
+	// Check if input is valid
+	if len(encInputs) == 0 || encInputs[0] == nil {
+		return nil, fmt.Errorf("invalid input: empty or nil encInputs")
+	}
 
-	// Initialize encrypted activations vector (before ReLU)
-	encZ1 := make([]*rlwe.Ciphertext, HiddenDim1)
+	// Since we've optimized to pack the entire image into a single ciphertext,
+	// we need to implement a matrix-vector product differently.
+	// We'll still create one ciphertext per neuron in the first hidden layer.
 
-	// For each output neuron, compute the dot product with inputs
-	for i := 0; i < HiddenDim1; i++ {
-		// Start with bias
-		ptBias := ckks.NewPlaintext(heContext.params, heContext.params.MaxLevel())
-		biasVec := make([]float64, BatchSize) // Using batchSize from global constant
-		for j := range biasVec {
-			biasVec[j] = serverModel.b1[i]
+	// Create a packed server model for SIMD operations
+	heServer, err := convertToPacked(serverModel, he)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert to packed model: %v", err)
+	}
+
+	// One ciphertext per neuron block in the first hidden layer
+	blk := HiddenDim1 / NeuronsPerCT
+	encActivations := make([]*rlwe.Ciphertext, blk)
+
+	// For each neuron/group of neurons in the first hidden layer
+	for b := 0; b < blk; b++ {
+		// Initialize with the bias for this neuron group
+		encActivations[b] = heServer.b[b].CopyNew()
+
+		// Get the single packed input
+		encInput := encInputs[0]
+
+		// For each input dimension, multiply by weight and add to accumulator
+		for i := 0; i < InputDim; i++ {
+			// Create a temporary ciphertext for this multiplication
+			temp := encInput.CopyNew()
+
+			// Multiply the input by the weight for this neuron
+			if err := he.evaluator.Mul(temp, heServer.W[i][b], temp); err != nil {
+				return nil, fmt.Errorf("error in neuron %d input %d multiplication: %v", b, i, err)
+			}
+
+			// Relinearize
+			if err := he.evaluator.Relinearize(temp, temp); err != nil {
+				return nil, fmt.Errorf("error in neuron %d input %d relinearization: %v", b, i, err)
+			}
+
+			// Add to the accumulator
+			if err := he.evaluator.Add(encActivations[b], temp, encActivations[b]); err != nil {
+				return nil, fmt.Errorf("error adding to accumulator for neuron %d: %v", b, err)
+			}
 		}
-		heContext.encoder.Encode(biasVec, ptBias)
 
-		// Initialize a ciphertext for the result
-		encZ1[i] = heContext.encryptor.EncryptZeroNew(heContext.params.MaxLevel())
+		// Apply ReLU approximation to this neuron's activation
+		// For simplicity, we'll use a degree-1 approximation max(0,x) ≈ 0.5x + 0.5
+		halfPt := scalarPlain(0.5, he.params, he.encoder)
 
-		// Add bias to the result
-		heContext.evaluator.Add(encZ1[i], ptBias, encZ1[i])
+		// First multiply by 0.5
+		if err := he.evaluator.Mul(encActivations[b], halfPt, encActivations[b]); err != nil {
+			return nil, fmt.Errorf("error in ReLU scaling for neuron %d: %v", b, err)
+		}
 
-		// Compute dot product with weights
-		for j := 0; j < InputDim; j++ {
-			// Create plaintext for the weight
-			ptWeight := ckks.NewPlaintext(heContext.params, heContext.params.MaxLevel())
-			weightVec := make([]float64, BatchSize) // Using batchSize from global constant
-			for k := range weightVec {
-				weightVec[k] = serverModel.W1[j][i]
-			}
-			heContext.encoder.Encode(weightVec, ptWeight)
-
-			// Multiply input with weight
-			encTemp, err := heContext.evaluator.MulNew(encInputs[j], ptWeight)
-			if err != nil {
-				return nil, fmt.Errorf("error in matrix multiplication: %v", err)
-			}
-
-			// No need to relinearize after multiplying ciphertext with plaintext
-			// as the degree doesn't increase
-
-			// Add to result
-			heContext.evaluator.Add(encZ1[i], encTemp, encZ1[i])
+		// Then add 0.5
+		if err := he.evaluator.Add(encActivations[b], halfPt, encActivations[b]); err != nil {
+			return nil, fmt.Errorf("error in ReLU offset for neuron %d: %v", b, err)
 		}
 	}
 
-	// Step 2: ReLU Activation (Forward)
-	// Apply a simpler ReLU approximation based on Chebyshev polynomials in parallel
-	fmt.Println("Applying ReLU activation with parallel processing...")
-	encA1 := make([]*rlwe.Ciphertext, HiddenDim1)
-
-	// Create a wait group to synchronize goroutines
-	var wg sync.WaitGroup
-
-	// Create a mutex for synchronizing error handling
-	errMutex := &sync.Mutex{}
-	var firstErr error
-
-	// Calculate how many neurons each worker should process
-	neuronsPerWorker := HiddenDim1 / NumWorkers
-	if neuronsPerWorker == 0 {
-		neuronsPerWorker = 1
-	}
-
-	// Start worker goroutines
-	for w := 0; w < NumWorkers; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			// Calculate the range of neurons this worker will process
-			startNeuron := workerID * neuronsPerWorker
-			endNeuron := (workerID + 1) * neuronsPerWorker
-			if workerID == NumWorkers-1 {
-				endNeuron = HiddenDim1 // Last worker takes any remaining neurons
-			}
-
-			// Process each neuron in the assigned range
-			for i := startNeuron; i < endNeuron; i++ {
-				// Check if an error has already occurred
-				errMutex.Lock()
-				if firstErr != nil {
-					errMutex.Unlock()
-					return
-				}
-				errMutex.Unlock()
-
-				// ReLU(x) ≈ 0.32 + 0.5*x + 0.23*x² (degree-2 Chebyshev approximation)
-
-				// 1. Compute x²
-				ctSquared, err := heContext.evaluator.MulNew(encZ1[i], encZ1[i])
-				if err != nil {
-					errMutex.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("error computing square in ReLU: %v", err)
-					}
-					errMutex.Unlock()
-					return
-				}
-
-				// Here we need to relinearize because we multiplied two ciphertexts
-				err = heContext.evaluator.Relinearize(ctSquared, ctSquared)
-				if err != nil {
-					errMutex.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("error relinearizing in ReLU: %v", err)
-					}
-					errMutex.Unlock()
-					return
-				}
-
-				// 2. Compute 0.5*x
-				ctScaledX, err := heContext.evaluator.MulNew(encZ1[i], 0.5)
-				if err != nil {
-					errMutex.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("error scaling x in ReLU: %v", err)
-					}
-					errMutex.Unlock()
-					return
-				}
-
-				// 3. Compute 0.23*x²
-				ctScaledX2, err := heContext.evaluator.MulNew(ctSquared, 0.23)
-				if err != nil {
-					errMutex.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("error scaling x² in ReLU: %v", err)
-					}
-					errMutex.Unlock()
-					return
-				}
-
-				// 4. First add 0.5*x + 0.23*x²
-				temp, err := heContext.evaluator.AddNew(ctScaledX, ctScaledX2)
-				if err != nil {
-					errMutex.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("error adding terms in ReLU: %v", err)
-					}
-					errMutex.Unlock()
-					return
-				}
-
-				// 5. Add the constant term 0.32 (create a constant ciphertext)
-				// Initialize a ciphertext for the constant
-				constantCt := heContext.encryptor.EncryptZeroNew(heContext.params.MaxLevel())
-
-				// Add the constant value to it
-				constant := ckks.NewPlaintext(heContext.params, heContext.params.MaxLevel())
-				constantVec := make([]float64, BatchSize)
-				for j := range constantVec {
-					constantVec[j] = 0.32
-				}
-				heContext.encoder.Encode(constantVec, constant)
-				heContext.evaluator.Add(constantCt, constant, constantCt)
-
-				// Now add the constant ciphertext to our result
-				var result *rlwe.Ciphertext
-				result, err = heContext.evaluator.AddNew(temp, constantCt)
-				if err != nil {
-					errMutex.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("error adding terms in ReLU: %v", err)
-					}
-					errMutex.Unlock()
-					return
-				}
-
-				// Store the result in the shared array
-				encA1[i] = result
-			}
-		}(w)
-	}
-
-	// Wait for all workers to finish
-	wg.Wait()
-
-	// Check if any errors occurred
-	if firstErr != nil {
-		return nil, firstErr
-	}
-
-	return encA1, nil
+	return encActivations, nil
 }

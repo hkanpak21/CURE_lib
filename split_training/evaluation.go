@@ -12,24 +12,19 @@ func evaluateModel(heContext *HEContext, clientModel *ClientModel, serverModel *
 
 	fmt.Println("Evaluating model on test data...")
 
-	// Parameters
-	evalBatchSize := 8 // Use smaller batch size for evaluation
-	numBatches := 10   // Only evaluate on a small subset for testing
+	// Parameters - with our optimized packing, we evaluate one example at a time
+	numExamples := 20 // Only evaluate on a small subset for testing
 	correct := 0
 
-	// Process batches
-	for batch := 0; batch < numBatches; batch++ {
-		fmt.Printf("  Evaluating batch %d/%d\n", batch+1, numBatches)
+	// Process individual examples
+	for i := 0; i < numExamples; i++ {
+		fmt.Printf("  Evaluating example %d/%d\n", i+1, numExamples)
 
-		// Get batch indices
-		startIdx := batch * evalBatchSize
-		batchIndices := make([]int, evalBatchSize)
-		for i := range batchIndices {
-			batchIndices[i] = startIdx + i
-		}
+		// Create indices array with just this example
+		indices := []int{i}
 
-		// Client prepares and encrypts inputs
-		encInputs, err := clientPrepareAndEncryptBatch(heContext, images, batchIndices)
+		// Client prepares and encrypts the single image
+		encInputs, err := clientPrepareAndEncryptBatch(heContext, images, indices)
 		if err != nil {
 			fmt.Printf("Error in client preparation: %v\n", err)
 			continue
@@ -43,46 +38,64 @@ func evaluateModel(heContext *HEContext, clientModel *ClientModel, serverModel *
 		}
 
 		// Client performs forward pass to get predictions
-		predictions, err := clientEvaluateForwardPass(heContext, clientModel, encActivations, evalBatchSize)
+		predictions, err := clientEvaluateForwardPass(heContext, clientModel, encActivations, 1)
 		if err != nil {
 			fmt.Printf("Error in client evaluation: %v\n", err)
 			continue
 		}
 
-		// Count correct predictions
-		for i := 0; i < evalBatchSize; i++ {
-			if predictions[i] == labels[batchIndices[i]] {
-				correct++
-			}
+		// Check if prediction is correct
+		if predictions[0] == labels[i] {
+			correct++
 		}
 	}
 
 	// Calculate accuracy
-	accuracy := float64(correct) / float64(numBatches*evalBatchSize)
+	accuracy := float64(correct) / float64(numExamples)
 	return accuracy
 }
 
 // Client forward pass for evaluation (no backpropagation)
 func clientEvaluateForwardPass(heContext *HEContext, clientModel *ClientModel, encActivations []*rlwe.Ciphertext, batchSize int) ([]int, error) {
+	// Check if activations are valid
+	if len(encActivations) == 0 {
+		return nil, fmt.Errorf("invalid input: empty encActivations")
+	}
+
 	// Step 1: Receive & Decrypt
+	// With our optimized approach, we have blk ciphertexts, each containing NeuronsPerCT neurons
+	neuronsPerBlock := HiddenDim1 / NeuronsPerCT
 	a1 := make([][]float64, HiddenDim1)
-	for i := 0; i < HiddenDim1; i++ {
-		// Decrypt the ciphertext
-		pt := heContext.decryptor.DecryptNew(encActivations[i])
+
+	// Process each block of neurons
+	for b := 0; b < neuronsPerBlock; b++ {
+		// Decrypt the ciphertext for this block
+		pt := heContext.decryptor.DecryptNew(encActivations[b])
 
 		// Decode the plaintext
-		decoded := make([]float64, batchSize)
+		decoded := make([]float64, heContext.params.N()/2)
 		heContext.encoder.Decode(pt, decoded)
 
-		a1[i] = decoded
+		// Extract values for each neuron in this block
+		for n := 0; n < NeuronsPerCT; n++ {
+			neuronIdx := b*NeuronsPerCT + n
+			if neuronIdx < HiddenDim1 {
+				// Just extract the first value for now
+				a1[neuronIdx] = []float64{decoded[n*BatchSize]}
+			}
+		}
 	}
+
+	// For simplicity in this optimization phase, we'll assume batchSize = 1
+	// In a full implementation, we would extract multiple examples from the slots
+	batchSize = 1
 
 	// Transpose a1 to have shape [batchSize x hiddenDim1]
 	a1Transposed := make([][]float64, batchSize)
 	for i := range a1Transposed {
 		a1Transposed[i] = make([]float64, HiddenDim1)
 		for j := 0; j < HiddenDim1; j++ {
-			a1Transposed[i][j] = a1[j][i]
+			a1Transposed[i][j] = a1[j][0] // Use [0] since we're only handling single examples for now
 		}
 	}
 
