@@ -3,6 +3,7 @@ package split
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
@@ -484,54 +485,117 @@ func packedUpdate(heContext *HEContext, serverModel *ServerModel, encInputs []*r
 		maxInputIdx := min(inputDim, len(encInputs))
 		maxOutputIdx := min(outputBlocks, len(encGradients))
 
+		// Use a WaitGroup to parallelize the update process
+		var wg sync.WaitGroup
+
+		// Error channel to collect errors from goroutines
+		errCh := make(chan error, maxInputIdx*maxOutputIdx)
+
 		// For each input dimension (limited by available inputs)
 		for i := 0; i < maxInputIdx; i++ {
+			// Capture loop variable
+			inputIdx := i
+
 			// For each output block (limited by available gradients)
 			for j := 0; j < maxOutputIdx; j++ {
-				// Compute outer product of input and gradient
-				// Expand input: duplicate each element to match with corresponding gradients
-				expandedInput := encInputs[i].CopyNew()
+				// Capture loop variable
+				outputIdx := j
 
-				// Extract the j-th block of gradients
-				gradBlock := encGradients[j].CopyNew()
+				// Increment WaitGroup counter
+				wg.Add(1)
 
-				// Multiply expanded input with gradient block (element-wise)
-				product := expandedInput.CopyNew()
-				if err := heContext.evaluator.Mul(expandedInput, gradBlock, product); err != nil {
-					return fmt.Errorf("error computing gradient product: %v", err)
-				}
+				// Launch goroutine for each weight update
+				go func(i, j int) {
+					defer wg.Done()
 
-				// Rescale product
-				if err := heContext.evaluator.Rescale(product, product); err != nil {
-					return fmt.Errorf("error rescaling product: %v", err)
-				}
+					// Compute outer product of input and gradient
+					// Expand input: duplicate each element to match with corresponding gradients
+					expandedInput := encInputs[i].CopyNew()
 
-				// Scale by learning rate (negative since we're doing gradient descent)
-				scaled := product.CopyNew()
-				if err := heContext.evaluator.Mul(product, -learningRate/float64(batchSize), scaled); err != nil {
-					return fmt.Errorf("error scaling by learning rate: %v", err)
-				}
+					// Extract the j-th block of gradients
+					gradBlock := encGradients[j].CopyNew()
 
-				// Add to current weights
-				if err := heContext.evaluator.Add(heServerPacked.W[l][i][j], scaled, heServerPacked.W[l][i][j]); err != nil {
-					return fmt.Errorf("error updating weights: %v", err)
-				}
+					// Multiply expanded input with gradient block (element-wise)
+					product := expandedInput.CopyNew()
+					if err := heContext.evaluator.Mul(expandedInput, gradBlock, product); err != nil {
+						errCh <- fmt.Errorf("error computing gradient product: %v", err)
+						return
+					}
+
+					// Rescale product
+					if err := heContext.evaluator.Rescale(product, product); err != nil {
+						errCh <- fmt.Errorf("error rescaling product: %v", err)
+						return
+					}
+
+					// Scale by learning rate (negative since we're doing gradient descent)
+					scaled := product.CopyNew()
+					if err := heContext.evaluator.Mul(product, -learningRate/float64(batchSize), scaled); err != nil {
+						errCh <- fmt.Errorf("error scaling by learning rate: %v", err)
+						return
+					}
+
+					// Add to current weights
+					if err := heContext.evaluator.Add(heServerPacked.W[l][i][j], scaled, heServerPacked.W[l][i][j]); err != nil {
+						errCh <- fmt.Errorf("error updating weights: %v", err)
+						return
+					}
+				}(inputIdx, outputIdx)
 			}
 		}
 
-		// Update biases (limited by available gradients)
-		maxBiasIdx := min(len(heServerPacked.b[l]), len(encGradients))
-		for j := 0; j < maxBiasIdx; j++ {
-			// Scale gradient by learning rate (negative for gradient descent)
-			scaledGrad := encGradients[j].CopyNew()
-			if err := heContext.evaluator.Mul(encGradients[j], -learningRate/float64(batchSize), scaledGrad); err != nil {
-				return fmt.Errorf("error scaling bias gradient: %v", err)
-			}
+		// Wait for all weight updates to complete
+		wg.Wait()
 
-			// Add to current biases
-			if err := heContext.evaluator.Add(heServerPacked.b[l][j], scaledGrad, heServerPacked.b[l][j]); err != nil {
-				return fmt.Errorf("error updating biases: %v", err)
-			}
+		// Check if there were any errors
+		select {
+		case err := <-errCh:
+			return err
+		default:
+			// No errors, continue
+		}
+
+		// Update biases (limited by available gradients) - also in parallel
+		maxBiasIdx := min(len(heServerPacked.b[l]), len(encGradients))
+
+		// Reset WaitGroup
+		wg = sync.WaitGroup{}
+
+		for j := 0; j < maxBiasIdx; j++ {
+			// Capture loop variable
+			biasIdx := j
+
+			// Increment WaitGroup counter
+			wg.Add(1)
+
+			// Launch goroutine for each bias update
+			go func(j int) {
+				defer wg.Done()
+
+				// Scale gradient by learning rate (negative for gradient descent)
+				scaledGrad := encGradients[j].CopyNew()
+				if err := heContext.evaluator.Mul(encGradients[j], -learningRate/float64(batchSize), scaledGrad); err != nil {
+					errCh <- fmt.Errorf("error scaling bias gradient: %v", err)
+					return
+				}
+
+				// Add to current biases
+				if err := heContext.evaluator.Add(heServerPacked.b[l][j], scaledGrad, heServerPacked.b[l][j]); err != nil {
+					errCh <- fmt.Errorf("error updating biases: %v", err)
+					return
+				}
+			}(biasIdx)
+		}
+
+		// Wait for all bias updates to complete
+		wg.Wait()
+
+		// Check if there were any errors
+		select {
+		case err := <-errCh:
+			return err
+		default:
+			// No errors, continue
 		}
 	}
 
