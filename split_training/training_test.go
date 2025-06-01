@@ -110,7 +110,7 @@ func TestServerWithFirstLayerBatchPerCiphertext(t *testing.T) {
 	}
 
 	// Run server forward pass
-	encActivations, err := serverForwardPass(heContext, serverModel, encInputs)
+	_, encActivations, err := ServerForwardPassWithLayerInputs(heContext, serverModel, encInputs)
 	if err != nil {
 		t.Fatalf("Failed in server forward pass: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestSimpleWeightStructure(t *testing.T) {
 	}
 
 	// Run server forward pass
-	encActivations, err := serverForwardPass(heContext, serverModel, encInputs)
+	_, encActivations, err := ServerForwardPassWithLayerInputs(heContext, serverModel, encInputs)
 	if err != nil {
 		t.Fatalf("Failed in server forward pass: %v", err)
 	}
@@ -299,4 +299,117 @@ func TestModelDimensions(t *testing.T) {
 	}
 
 	t.Log("Model dimensions match configuration as expected")
+}
+
+// TestConfigurableNetwork tests a server model with multiple layers
+func TestConfigurableNetwork(t *testing.T) {
+	// Set batch size for this test
+	restore := setTestBatchSize(2)
+	defer restore()
+
+	// Initialize HE context
+	heContext, err := initHE()
+	if err != nil {
+		t.Fatalf("Failed to initialize HE context: %v", err)
+	}
+
+	// Create a configuration with multiple server layers
+	config := &ModelConfig{
+		Arch:     []int{784, 64, 32, 16, 10}, // Deeper architecture for testing
+		SplitIdx: 3,                          // Server has 3 layers (784->64->32->16), client has 1 (16->10)
+	}
+
+	// Initialize client and server models
+	clientModel := initClientModel(config)
+	serverModel := initServerModel(config)
+
+	// Verify server model has the correct number of layers
+	if len(serverModel.Weights) != 3 {
+		t.Errorf("Expected server to have 3 layers, got %d", len(serverModel.Weights))
+	}
+
+	// Verify client model has the correct number of layers
+	if len(clientModel.Weights) != 1 {
+		t.Errorf("Expected client to have 1 layer, got %d", len(clientModel.Weights))
+	}
+
+	// Create sample data
+	numSamples := 4
+	images := make([][]float64, numSamples)
+	for i := range images {
+		images[i] = make([]float64, 784)
+		for j := range images[i] {
+			images[i][j] = float64(i+j) / 1000.0
+		}
+	}
+	labels := []int{0, 1, 2, 3}
+	batchIndices := []int{0, 1}
+
+	// Test forward pass with layered inputs
+	t.Log("Testing forward pass with multiple server layers...")
+
+	// Prepare and encrypt the batch
+	encInputs, err := clientPrepareAndEncryptBatch(heContext, images, batchIndices)
+	if err != nil {
+		t.Fatalf("Failed to prepare and encrypt batch: %v", err)
+	}
+
+	// Run server forward pass and verify we get cached layer inputs
+	layerInputs, encActivations, err := ServerForwardPassWithLayerInputs(heContext, serverModel, encInputs)
+	if err != nil {
+		t.Fatalf("Failed in server forward pass: %v", err)
+	}
+
+	// Verify we have the correct number of layer inputs (numLayers + 1)
+	expectedLayers := len(serverModel.Weights) + 1
+	if len(layerInputs) != expectedLayers {
+		t.Fatalf("Expected %d layer inputs, got %d", expectedLayers, len(layerInputs))
+	}
+
+	// Verify first layer input is the original input
+	if len(layerInputs[0]) != len(encInputs) {
+		t.Fatalf("First layer input should match original input: expected %d, got %d",
+			len(encInputs), len(layerInputs[0]))
+	}
+
+	// Run client forward and backward pass
+	encGradients, err := clientForwardAndBackward(heContext, clientModel, encActivations, labels, batchIndices)
+	if err != nil {
+		t.Fatalf("Failed in client forward and backward: %v", err)
+	}
+
+	// Make a copy of the original weights for comparison
+	originalWeights := make([][][]float64, len(serverModel.Weights))
+	for l := range serverModel.Weights {
+		originalWeights[l] = make([][]float64, len(serverModel.Weights[l]))
+		for i := range serverModel.Weights[l] {
+			originalWeights[l][i] = make([]float64, len(serverModel.Weights[l][i]))
+			copy(originalWeights[l][i], serverModel.Weights[l][i])
+		}
+	}
+
+	// Run server backward pass with layered inputs
+	err = serverBackwardAndUpdate(heContext, serverModel, encGradients, layerInputs, 0.01)
+	if err != nil {
+		t.Fatalf("Failed in server backward and update: %v", err)
+	}
+
+	// Verify weights have been updated for all layers
+	weightsChanged := false
+	for l := range serverModel.Weights {
+		for i := range serverModel.Weights[l] {
+			for j := range serverModel.Weights[l][i] {
+				if serverModel.Weights[l][i][j] != originalWeights[l][i][j] {
+					weightsChanged = true
+					break
+				}
+			}
+		}
+	}
+
+	if !weightsChanged {
+		t.Fatalf("Server weights were not updated after backward pass")
+	}
+
+	t.Log("Configurable network test passed - multiple server layers successfully updated")
 }

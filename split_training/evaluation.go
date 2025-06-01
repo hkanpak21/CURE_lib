@@ -29,7 +29,7 @@ func evaluateModel(heContext *HEContext, clientModel *ClientModel, serverModel *
 		}
 
 		// Server performs forward pass
-		encActivations, err := serverForwardPass(heContext, serverModel, encInputs)
+		_, encActivations, err := ServerForwardPassWithLayerInputs(heContext, serverModel, encInputs)
 		if err != nil {
 			fmt.Printf("Error in server forward pass: %v\n", err)
 			continue
@@ -69,7 +69,7 @@ func EvaluateModelOnBatch(heContext *HEContext, clientModel *ClientModel, server
 	}
 
 	// Server performs forward pass
-	encActivations, err := serverForwardPass(heContext, serverModel, encInputs)
+	_, encActivations, err := ServerForwardPassWithLayerInputs(heContext, serverModel, encInputs)
 	if err != nil {
 		return 0, fmt.Errorf("error in server forward pass: %v", err)
 	}

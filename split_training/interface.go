@@ -26,6 +26,12 @@ func ClientPrepareAndEncryptBatch(he *HEContext, imgs [][]float64, idx []int) ([
 
 // ServerForwardPass performs the forward pass on the server side
 func ServerForwardPass(he *HEContext, serverModel *ServerModel, encInputs []*rlwe.Ciphertext) ([]*rlwe.Ciphertext, error) {
+	_, encActivations, err := serverForwardPass(he, serverModel, encInputs)
+	return encActivations, err
+}
+
+// ServerForwardPassWithLayerInputs performs the forward pass and returns both layerInputs and final activations
+func ServerForwardPassWithLayerInputs(he *HEContext, serverModel *ServerModel, encInputs []*rlwe.Ciphertext) ([][]*rlwe.Ciphertext, []*rlwe.Ciphertext, error) {
 	return serverForwardPass(he, serverModel, encInputs)
 }
 
@@ -37,6 +43,6 @@ func ClientForwardAndBackward(heContext *HEContext, clientModel *ClientModel, en
 
 // ServerBackwardAndUpdate performs the backward pass and updates the server model weights
 func ServerBackwardAndUpdate(heContext *HEContext, serverModel *ServerModel, encGradients []*rlwe.Ciphertext,
-	cachedInputs []*rlwe.Ciphertext, learningRate float64) error {
-	return serverBackwardAndUpdate(heContext, serverModel, encGradients, cachedInputs, learningRate)
+	cachedLayerInputs [][]*rlwe.Ciphertext, learningRate float64) error {
+	return serverBackwardAndUpdate(heContext, serverModel, encGradients, cachedLayerInputs, learningRate)
 }

@@ -21,23 +21,30 @@ func clientPrepareAndEncryptBatch(he *HEContext, imgs [][]float64, idx []int) ([
 	// Create a ciphertext for each image in the batch
 	encInputs := make([]*rlwe.Ciphertext, batch)
 
-	// Create a buffer for encoding
-	vec := make([]float64, slots)
+	// Use mutex to protect access to the encInputs slice and error reporting
+	var mu sync.Mutex
+	var encError error
 
-	// Process each image in the batch
-	for b := 0; b < batch; b++ {
+	// Process images in parallel
+	parallelFor(0, batch, func(b int) {
+		// Early return if an error was already encountered
+		if encError != nil {
+			return
+		}
+
 		imgIdx := idx[b]
 		img := imgs[imgIdx]
 		pixelsPerImage := len(img)
 
 		if pixelsPerImage > slots {
-			return nil, fmt.Errorf("image too large for slot capacity: %d pixels > %d slots", pixelsPerImage, slots)
+			mu.Lock()
+			encError = fmt.Errorf("image too large for slot capacity: %d pixels > %d slots", pixelsPerImage, slots)
+			mu.Unlock()
+			return
 		}
 
-		// Clear the buffer
-		for i := range vec {
-			vec[i] = 0
-		}
+		// Create a buffer for encoding
+		vec := make([]float64, slots)
 
 		// Copy the image pixels into the vector
 		for i := 0; i < pixelsPerImage; i++ {
@@ -49,11 +56,22 @@ func clientPrepareAndEncryptBatch(he *HEContext, imgs [][]float64, idx []int) ([
 		he.encoder.Encode(vec, pt)
 
 		// Encrypt
-		var err error
-		encInputs[b], err = he.encryptor.EncryptNew(pt)
+		ct, err := he.encryptor.EncryptNew(pt)
 		if err != nil {
-			return nil, fmt.Errorf("encryption error for image %d: %v", b, err)
+			mu.Lock()
+			encError = fmt.Errorf("encryption error for image %d: %v", b, err)
+			mu.Unlock()
+			return
 		}
+
+		// Store the encrypted result
+		mu.Lock()
+		encInputs[b] = ct
+		mu.Unlock()
+	})
+
+	if encError != nil {
+		return nil, encError
 	}
 
 	return encInputs, nil
@@ -217,88 +235,108 @@ func parallelFor(start, end int, fn func(int)) {
 	wg.Wait()
 }
 
-// Server performs forward pass on encrypted inputs with optimized parallel processing
-// Each ciphertext contains a single image
-func serverForwardPass(he *HEContext, serverModel *ServerModel, encInputs []*rlwe.Ciphertext) ([]*rlwe.Ciphertext, error) {
+// Server performs forward pass on encrypted input
+func serverForwardPass(he *HEContext, serverModel *ServerModel, encInputs []*rlwe.Ciphertext) ([][]*rlwe.Ciphertext, []*rlwe.Ciphertext, error) {
+	// Get number of layers in the server model
+	numLayers := len(serverModel.Weights)
+
+	// Create a slice to store the inputs for each layer (including the initial input)
+	layerInputs := make([][]*rlwe.Ciphertext, numLayers+1)
+	layerInputs[0] = encInputs // First layer's input is the original encrypted input
+
 	// Check if input is valid
-	if len(encInputs) == 0 || encInputs[0] == nil {
-		return nil, fmt.Errorf("invalid input: empty or nil encInputs")
+	if len(encInputs) == 0 {
+		return nil, nil, fmt.Errorf("invalid input: empty encInputs")
 	}
 
-	// Create a packed server model for SIMD operations
-	heServer, err := convertToPacked(serverModel, he)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert to packed model: %v", err)
-	}
+	// Process each layer
+	for l := 0; l < numLayers; l++ {
+		// Get the dimensions of the current layer
+		inputDim := serverModel.GetLayerInputDim(l)
+		outputDim := serverModel.GetLayerOutputDim(l)
 
-	// Number of images in the batch
-	batchSize := len(encInputs)
-
-	// Process each image separately
-	resultOutputs := make([]*rlwe.Ciphertext, batchSize)
-
-	// For each image in the batch
-	for batchIdx := 0; batchIdx < batchSize; batchIdx++ {
-		// Process each layer in the server model
-		currentLayerOutput := encInputs[batchIdx : batchIdx+1] // Slice with single ciphertext
-
-		for l := 0; l < len(serverModel.Weights); l++ {
-			inputDim := serverModel.GetLayerInputDim(l)
-			outputDim := serverModel.GetLayerOutputDim(l)
-
-			// Calculate the number of blocks needed for the output neurons
-			neuronsPerCT := heServer.NeuronsPerCT
-			numBlocks := (outputDim + neuronsPerCT - 1) / neuronsPerCT
-
-			// Prepare the next layer activations
-			nextLayer := make([]*rlwe.Ciphertext, numBlocks)
-
-			// Create a mutex for thread-safe access to shared resources
-			var mutex sync.Mutex
-
-			// Process each block of neurons in parallel
-			parallelFor(0, numBlocks, func(b int) {
-				// Initialize with bias for this neuron block
-				blockResult := heServer.b[l][b].CopyNew()
-
-				// Get the input for this image
-				encInput := currentLayerOutput[0]
-
-				// For each input dimension, multiply by weight and add to accumulator
-				for i := 0; i < inputDim; i++ {
-					// Create a temporary ciphertext for this multiplication
-					temp := encInput.CopyNew()
-
-					// Multiply the input by the weight for this neuron block
-					he.evaluator.Mul(temp, heServer.W[l][i][b], temp)
-
-					// Relinearize
-					he.evaluator.Relinearize(temp, temp)
-
-					// Add to the accumulator
-					he.evaluator.Add(blockResult, temp, blockResult)
-				}
-
-				// Apply ReLU approximation to this block's activation
-				activatedBlock, err := applyReLU(he, blockResult)
-				if err != nil {
-					fmt.Printf("Error in ReLU for block %d: %v\n", b, err)
-					return
-				}
-
-				// Safely store the result
-				mutex.Lock()
-				nextLayer[b] = activatedBlock
-				mutex.Unlock()
-			})
-
-			// Update current layer for the next iteration
-			currentLayerOutput = nextLayer
+		// Ensure encInputs has the right size
+		if len(encInputs) != inputDim && l == 0 {
+			return nil, nil, fmt.Errorf("input dimension mismatch: got %d, expected %d", len(encInputs), inputDim)
 		}
 
-		// Store the final output for this image
-		resultOutputs[batchIdx] = currentLayerOutput[0]
+		// Create a slice for the current layer's outputs
+		var layerOutputs []*rlwe.Ciphertext
+
+		// Process the inputs one at a time for this layer
+		for j := 0; j < outputDim; j++ {
+			// Initialize a ciphertext with zeros for the output neuron
+			// Create a zero plaintext
+			zeroPlaintext := ckks.NewPlaintext(he.params, he.params.MaxLevel())
+			// Encrypt it
+			outputCipher, err := he.encryptor.EncryptNew(zeroPlaintext)
+			if err != nil {
+				return nil, nil, fmt.Errorf("error initializing output: %v", err)
+			}
+
+			// Compute weighted sum: W[l][i][j] * encInputs[i] + b[l][j]
+			for i := 0; i < inputDim; i++ {
+				// Get current input
+				current := layerInputs[l][i]
+
+				// Multiply by weight
+				weight := serverModel.GetWeight(l, i, j)
+
+				// Create a plaintext for the weight
+				weightPlaintext := ckks.NewPlaintext(he.params, he.params.MaxLevel())
+				// Encode a single value in all slots
+				values := make([]float64, he.params.N()/2)
+				for k := range values {
+					values[k] = weight
+				}
+				he.encoder.Encode(values, weightPlaintext)
+
+				// Multiply input by weight
+				weighted := current.CopyNew()
+				if err := he.evaluator.Mul(weighted, weightPlaintext, weighted); err != nil {
+					return nil, nil, fmt.Errorf("error in weight multiplication: %v", err)
+				}
+
+				// Add to the output
+				if err := he.evaluator.Add(outputCipher, weighted, outputCipher); err != nil {
+					return nil, nil, fmt.Errorf("error in accumulation: %v", err)
+				}
+			}
+
+			// Add bias
+			bias := serverModel.Biases[l][j]
+
+			// Create a plaintext for the bias
+			biasPlaintext := ckks.NewPlaintext(he.params, he.params.MaxLevel())
+			// Encode a single value in all slots
+			biasValues := make([]float64, he.params.N()/2)
+			for k := range biasValues {
+				biasValues[k] = bias
+			}
+			he.encoder.Encode(biasValues, biasPlaintext)
+
+			if err := he.evaluator.Add(outputCipher, biasPlaintext, outputCipher); err != nil {
+				return nil, nil, fmt.Errorf("error adding bias: %v", err)
+			}
+
+			// Apply ReLU activation if not the last layer
+			if l < numLayers-1 {
+				// Use the existing applyReLU function
+				activatedCipher, err := applyReLU(he, outputCipher)
+				if err != nil {
+					return nil, nil, fmt.Errorf("error applying ReLU: %v", err)
+				}
+				outputCipher = activatedCipher
+			}
+
+			// Add the output neuron to the outputs
+			layerOutputs = append(layerOutputs, outputCipher)
+		}
+
+		// Store this layer's outputs as the next layer's inputs
+		layerInputs[l+1] = layerOutputs
 	}
 
-	return resultOutputs, nil
+	// Return both the layer inputs (for backpropagation) and the final layer's output
+	return layerInputs, layerInputs[numLayers], nil
 }

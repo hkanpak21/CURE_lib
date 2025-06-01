@@ -184,7 +184,7 @@ func trainModelWithBatches(heContext *HEContext, clientModel *ClientModel, serve
 func trainBatchWithTiming(heContext *HEContext, clientModel *ClientModel, serverModel *ServerModel,
 	images [][]float64, labels []int, batchIndices []int, learningRate float64, metrics *TimingMetrics) {
 
-	// Check if metrics is nil
+	// Flag to track metrics (if metrics is not nil)
 	trackMetrics := metrics != nil
 
 	// Phase 1: Client-Side Prep and Forward to Server
@@ -202,7 +202,7 @@ func trainBatchWithTiming(heContext *HEContext, clientModel *ClientModel, server
 
 	// Phase 2: Server-Side Homomorphic Forward Pass
 	serverStart := time.Now()
-	encActivations, err := serverForwardPass(heContext, serverModel, encInputs)
+	layerInputs, encActivations, err := ServerForwardPassWithLayerInputs(heContext, serverModel, encInputs)
 	serverTime := time.Since(serverStart)
 	if trackMetrics {
 		metrics.totalServerForwardTime += serverTime
@@ -228,8 +228,8 @@ func trainBatchWithTiming(heContext *HEContext, clientModel *ClientModel, server
 
 	// Phase 4: Server-Side Homomorphic Backward Pass & Update
 	serverBackStart := time.Now()
-	// Pass the cached encInputs to serverBackwardAndUpdate for accurate weight updates
-	err = serverBackwardAndUpdate(heContext, serverModel, encGradients, encInputs, learningRate)
+	// Pass the cached layer inputs to serverBackwardAndUpdate for accurate weight updates
+	err = serverBackwardAndUpdate(heContext, serverModel, encGradients, layerInputs, learningRate)
 	serverBackTime := time.Since(serverBackStart)
 	if trackMetrics {
 		metrics.totalServerBackwardTime += serverBackTime
@@ -253,7 +253,7 @@ func trainBatchFullHomomorphic(heContext *HEContext, clientModel *ClientModel, s
 	}
 
 	// 2. Server: Forward pass
-	encActivations, err := serverForwardPass(heContext, serverModel, encInputs)
+	layerInputs, encActivations, err := ServerForwardPassWithLayerInputs(heContext, serverModel, encInputs)
 	if err != nil {
 		return fmt.Errorf("server forward pass error: %v", err)
 	}
@@ -264,15 +264,11 @@ func trainBatchFullHomomorphic(heContext *HEContext, clientModel *ClientModel, s
 		return fmt.Errorf("client forward/backward error: %v", err)
 	}
 
-	// 4. Server: Fully homomorphic backward pass and weight update using packed SIMD
-	// We'll use serverBackwardAndUpdate which handles the packed format correctly
-	err = serverBackwardAndUpdate(heContext, serverModel, encGradBlk, encInputs, learningRate)
+	// 4. Server: Fully homomorphic backward pass and weight update
+	err = serverBackwardAndUpdate(heContext, serverModel, encGradBlk, layerInputs, learningRate)
 	if err != nil {
 		return fmt.Errorf("homomorphic backward error: %v", err)
 	}
-
-	// 5. We don't need to manually convert back the model since serverBackwardAndUpdate
-	// already updates the serverModel directly
 
 	return nil
 }
