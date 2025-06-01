@@ -13,490 +13,602 @@ import (
 func clientForwardAndBackward(heContext *HEContext, clientModel *ClientModel, encActivations []*rlwe.Ciphertext,
 	labels []int, batchIndices []int) ([]*rlwe.Ciphertext, error) {
 
-	// With our optimized server forward pass, we're currently handling one example at a time
-	batchSize := 1
+	batchSize := len(batchIndices)
+	if batchSize == 0 {
+		return nil, fmt.Errorf("empty batch")
+	}
 
 	// Check if activations are valid
 	if len(encActivations) == 0 {
 		return nil, fmt.Errorf("invalid input: empty encActivations")
 	}
 
-	// Step 1: Receive & Decrypt
-	// With our optimized approach, we have blk ciphertexts, each containing NeuronsPerCT neurons
-	neurons_per_block := HiddenDim1 / NeuronsPerCT
-	a1 := make([][]float64, HiddenDim1)
+	// Get dimensions from configuration
+	clientLayers := len(clientModel.Weights)
+	if clientLayers == 0 {
+		return nil, fmt.Errorf("client model has no layers")
+	}
 
-	// Process each block of neurons
-	for b := 0; b < neurons_per_block; b++ {
-		// Decrypt the ciphertext for this block
-		pt := heContext.decryptor.DecryptNew(encActivations[b])
+	// Input dimension for the client is the output of the server's last layer
+	inputDim := clientModel.GetLayerInputDim(0)
 
-		// Decode the plaintext - in our optimized version, we get values in slots
+	// Step 1: Receive & Decrypt server's activations
+	// Each ciphertext represents a single image
+	a1Transposed := make([][]float64, batchSize)
+
+	// Process each image in the batch
+	for i := 0; i < batchSize; i++ {
+		// Decrypt the ciphertext for this image
+		pt := heContext.decryptor.DecryptNew(encActivations[i])
+
+		// Decode the plaintext - we get values in slots
 		decoded := make([]float64, heContext.params.N()/2)
 		heContext.encoder.Decode(pt, decoded)
 
-		// Extract values for each neuron in this block
-		for n := 0; n < NeuronsPerCT; n++ {
-			neuronIdx := b*NeuronsPerCT + n
-			if neuronIdx < HiddenDim1 {
-				// Just extract the first value for now
-				a1[neuronIdx] = []float64{decoded[n*BatchSize]}
-			}
-		}
-	}
-
-	// Transpose a1 to have shape [batchSize x hiddenDim1]
-	a1Transposed := make([][]float64, batchSize)
-	for i := range a1Transposed {
-		a1Transposed[i] = make([]float64, HiddenDim1)
-		for j := 0; j < HiddenDim1; j++ {
-			a1Transposed[i][j] = a1[j][0]
+		// Extract values for each neuron
+		a1Transposed[i] = make([]float64, inputDim)
+		for j := 0; j < inputDim; j++ {
+			a1Transposed[i][j] = decoded[j]
 		}
 	}
 
 	// Step 2: Forward Pass through Client's Layers
-	// Compute a2 = ReLU(a1 * W2 + b2)
-	a2 := make([][]float64, batchSize)
-	for i := range a2 {
-		a2[i] = make([]float64, HiddenDim2)
+	// Store activations for each layer (including input)
+	activations := make([][][]float64, clientLayers+1)
+	activations[0] = a1Transposed // Input layer
 
-		// Compute linear combination
-		for j := 0; j < HiddenDim2; j++ {
-			a2[i][j] = clientModel.b2[j]
-			for k := 0; k < HiddenDim1; k++ {
-				a2[i][j] += a1Transposed[i][k] * clientModel.W2[k][j]
+	// Process each layer
+	for l := 0; l < clientLayers; l++ {
+		inputDim := clientModel.GetLayerInputDim(l)
+		outputDim := clientModel.GetLayerOutputDim(l)
+
+		// Initialize this layer's activations
+		activations[l+1] = make([][]float64, batchSize)
+		for i := range activations[l+1] {
+			activations[l+1][i] = make([]float64, outputDim)
+
+			// Compute linear combination: act = prev_act * W + b
+			for j := 0; j < outputDim; j++ {
+				activations[l+1][i][j] = clientModel.Biases[l][j] // Add bias
+
+				for k := 0; k < inputDim; k++ {
+					activations[l+1][i][j] += activations[l][i][k] * clientModel.GetWeight(l, k, j)
+				}
 			}
-		}
 
-		// Apply ReLU
-		for j := range a2[i] {
-			if a2[i][j] < 0 {
-				a2[i][j] = 0
+			// Apply ReLU activation if not the output layer
+			if l < clientLayers-1 {
+				for j := range activations[l+1][i] {
+					if activations[l+1][i][j] < 0 {
+						activations[l+1][i][j] = 0
+					}
+				}
 			}
 		}
 	}
 
-	// Compute a3 = a2 * W3 + b3
-	a3 := make([][]float64, batchSize)
-	for i := range a3 {
-		a3[i] = make([]float64, OutputDim)
-
-		// Compute linear combination
-		for j := 0; j < OutputDim; j++ {
-			a3[i][j] = clientModel.b3[j]
-			for k := 0; k < HiddenDim2; k++ {
-				a3[i][j] += a2[i][k] * clientModel.W3[k][j]
-			}
-		}
-	}
+	// Output layer activations
+	outputActivations := activations[clientLayers]
 
 	// Step 3: Compute Loss (Cross-Entropy Loss)
 	// Apply softmax and compute cross-entropy loss
-	loss := 0.0
+	outputDim := clientModel.GetLayerOutputDim(clientLayers - 1)
 
 	// For tracking softmax values for gradient computation
 	softmaxValues := make([][]float64, batchSize)
 
 	for i := 0; i < batchSize; i++ {
-		// Apply softmax: exp(a3) / sum(exp(a3))
-		maxVal := a3[i][0]
-		for j := 1; j < OutputDim; j++ {
-			if a3[i][j] > maxVal {
-				maxVal = a3[i][j]
+		// Apply softmax: exp(output) / sum(exp(output))
+		maxVal := outputActivations[i][0]
+		for j := 1; j < outputDim; j++ {
+			if outputActivations[i][j] > maxVal {
+				maxVal = outputActivations[i][j]
 			}
 		}
 
 		expSum := 0.0
-		expValues := make([]float64, OutputDim)
-		for j := 0; j < OutputDim; j++ {
-			expValues[j] = math.Exp(a3[i][j] - maxVal)
+		expValues := make([]float64, outputDim)
+		for j := 0; j < outputDim; j++ {
+			expValues[j] = math.Exp(outputActivations[i][j] - maxVal)
 			expSum += expValues[j]
 		}
 
 		// Compute softmax
-		softmaxValues[i] = make([]float64, OutputDim)
-		for j := 0; j < OutputDim; j++ {
+		softmaxValues[i] = make([]float64, outputDim)
+		for j := 0; j < outputDim; j++ {
 			softmaxValues[i][j] = expValues[j] / expSum
 		}
 
-		// Cross-entropy loss: -sum(y_true * log(y_pred))
-		// For one-hot encoded labels, this simplifies to -log(y_pred[true_label])
-		trueLabel := labels[batchIndices[i]]
-		loss += -math.Log(softmaxValues[i][trueLabel])
+		// Cross-entropy loss computation is commented out as it's not used in the algorithm
+		// but kept for reference and future logging purposes
+		// trueLabel := labels[batchIndices[i]]
+		// loss += -math.Log(softmaxValues[i][trueLabel])
 	}
-	loss /= float64(batchSize)
+	// loss /= float64(batchSize)
 
 	// Step 4: Compute Gradients (Backward)
-	// Start with output layer gradients
-	dZ3 := make([][]float64, batchSize)
-	for i := range dZ3 {
-		dZ3[i] = make([]float64, OutputDim)
-		for j := 0; j < OutputDim; j++ {
+	// Initialize arrays to store gradients for each layer
+	dZ := make([][][]float64, clientLayers)
+	dW := make([][][]float64, clientLayers)
+	db := make([][]float64, clientLayers)
+
+	// Output layer gradients (start backpropagation)
+	outputLayerIdx := clientLayers - 1
+	dZ[outputLayerIdx] = make([][]float64, batchSize)
+
+	for i := range dZ[outputLayerIdx] {
+		dZ[outputLayerIdx][i] = make([]float64, outputDim)
+		for j := 0; j < outputDim; j++ {
 			// Derivative of softmax cross-entropy is (softmax - one_hot_true)
 			if j == labels[batchIndices[i]] {
 				// Softmax - 1.0 for true class
-				dZ3[i][j] = softmaxValues[i][j] - 1.0
+				dZ[outputLayerIdx][i][j] = softmaxValues[i][j] - 1.0
 			} else {
 				// Softmax for other classes
-				dZ3[i][j] = softmaxValues[i][j]
+				dZ[outputLayerIdx][i][j] = softmaxValues[i][j]
 			}
 		}
 	}
 
-	// Compute gradients for output layer weights
-	dW3 := make([][]float64, HiddenDim2)
-	for i := range dW3 {
-		dW3[i] = make([]float64, OutputDim)
-		for j := 0; j < OutputDim; j++ {
-			for k := 0; k < batchSize; k++ {
-				dW3[i][j] += a2[k][i] * dZ3[k][j]
-			}
-			dW3[i][j] /= float64(batchSize)
-		}
-	}
+	// Backpropagate through each layer
+	for l := clientLayers - 1; l >= 0; l-- {
+		inputDim := clientModel.GetLayerInputDim(l)
+		outputDim := clientModel.GetLayerOutputDim(l)
 
-	// Compute gradients for output layer biases
-	db3 := make([]float64, OutputDim)
-	for i := 0; i < OutputDim; i++ {
-		for j := 0; j < batchSize; j++ {
-			db3[i] += dZ3[j][i]
-		}
-		db3[i] /= float64(batchSize)
-	}
-
-	// Compute gradients for hidden layer
-	dZ2 := make([][]float64, batchSize)
-	for i := range dZ2 {
-		dZ2[i] = make([]float64, HiddenDim2)
-		for j := 0; j < HiddenDim2; j++ {
-			for k := 0; k < OutputDim; k++ {
-				dZ2[i][j] += dZ3[i][k] * clientModel.W3[j][k]
+		// Compute weight gradients for this layer
+		dW[l] = make([][]float64, inputDim)
+		for i := 0; i < inputDim; i++ {
+			// Skip if index is out of bounds for the current layer
+			if i >= len(clientModel.Weights[l]) {
+				fmt.Printf("Warning: Skipping out-of-bounds index i=%d for layer %d (weights dim: %d)\n",
+					i, l, len(clientModel.Weights[l]))
+				dW[l][i] = make([]float64, outputDim) // Still create the array to avoid nil references
+				continue
 			}
-			// ReLU derivative: 0 if input <= 0, 1 otherwise
-			if a2[i][j] <= 0 {
-				dZ2[i][j] = 0
+
+			dW[l][i] = make([]float64, outputDim)
+			for j := 0; j < outputDim; j++ {
+				for k := 0; k < batchSize; k++ {
+					dW[l][i][j] += activations[l][k][i] * dZ[l][k][j]
+				}
+				dW[l][i][j] /= float64(batchSize)
 			}
 		}
-	}
 
-	// Compute gradients for hidden layer weights
-	dW2 := make([][]float64, HiddenDim1)
-	for i := range dW2 {
-		dW2[i] = make([]float64, HiddenDim2)
-		for j := 0; j < HiddenDim2; j++ {
-			for k := 0; k < batchSize; k++ {
-				dW2[i][j] += a1Transposed[k][i] * dZ2[k][j]
+		// Compute bias gradients for this layer
+		db[l] = make([]float64, outputDim)
+		for i := 0; i < outputDim; i++ {
+			for j := 0; j < batchSize; j++ {
+				db[l][i] += dZ[l][j][i]
 			}
-			dW2[i][j] /= float64(batchSize)
+			db[l][i] /= float64(batchSize)
 		}
-	}
 
-	db2 := make([]float64, HiddenDim2)
-	for i := 0; i < HiddenDim2; i++ {
-		for j := 0; j < batchSize; j++ {
-			db2[i] += dZ2[j][i]
-		}
-		db2[i] /= float64(batchSize)
-	}
+		// Compute gradients for previous layer if not at input layer
+		if l > 0 {
+			prevLayerDim := clientModel.GetLayerInputDim(l - 1)
+			dZ[l-1] = make([][]float64, batchSize)
 
-	// Compute gradients for first hidden layer
-	dA1 := make([][]float64, batchSize)
-	for i := range dA1 {
-		dA1[i] = make([]float64, HiddenDim1)
-		for j := 0; j < HiddenDim1; j++ {
-			for k := 0; k < HiddenDim2; k++ {
-				dA1[i][j] += dZ2[i][k] * clientModel.W2[j][k]
+			for i := range dZ[l-1] {
+				dZ[l-1][i] = make([]float64, prevLayerDim)
+				for j := 0; j < prevLayerDim; j++ {
+					// Skip if index is out of bounds for the current layer
+					if j >= len(clientModel.Weights[l]) {
+						fmt.Printf("Warning: Skipping out-of-bounds index j=%d for layer %d (weights dim: %d)\n",
+							j, l, len(clientModel.Weights[l]))
+						continue
+					}
+
+					for k := 0; k < outputDim; k++ {
+						dZ[l-1][i][j] += dZ[l][i][k] * clientModel.GetWeight(l, j, k)
+					}
+
+					// Apply ReLU derivative if not the input layer
+					if l > 0 {
+						// ReLU derivative: 0 if input <= 0, 1 otherwise
+						if activations[l][i][j] <= 0 {
+							dZ[l-1][i][j] = 0
+						}
+					}
+				}
 			}
-		}
-	}
-
-	// Transpose dA1 to have shape [hiddenDim1 x batchSize]
-	dA1Transposed := make([][]float64, HiddenDim1)
-	for i := range dA1Transposed {
-		dA1Transposed[i] = make([]float64, batchSize)
-		for j := 0; j < batchSize; j++ {
-			dA1Transposed[i][j] = dA1[j][i]
 		}
 	}
 
 	// Step 5: Update Client's Weights
-	// Update W3 and b3
-	for i := 0; i < HiddenDim2; i++ {
-		for j := 0; j < OutputDim; j++ {
-			clientModel.W3[i][j] -= LearningRate * dW3[i][j]
+	// Update weights and biases for each layer
+	for l := 0; l < clientLayers; l++ {
+		inputDim := clientModel.GetLayerInputDim(l)
+		outputDim := clientModel.GetLayerOutputDim(l)
+
+		// Update weights
+		for i := 0; i < inputDim; i++ {
+			for j := 0; j < outputDim; j++ {
+				newWeight := clientModel.GetWeight(l, i, j) - LearningRate*dW[l][i][j]
+				clientModel.SetWeight(l, i, j, newWeight)
+			}
+		}
+
+		// Update biases
+		for j := 0; j < outputDim; j++ {
+			clientModel.Biases[l][j] -= LearningRate * db[l][j]
 		}
 	}
 
-	for i := 0; i < OutputDim; i++ {
-		clientModel.b3[i] -= LearningRate * db3[i]
-	}
-
-	// Update W2 and b2
-	for i := 0; i < HiddenDim1; i++ {
-		for j := 0; j < HiddenDim2; j++ {
-			clientModel.W2[i][j] -= LearningRate * dW2[i][j]
+	// Step 6: Prepare gradients for the server (gradients for the input layer)
+	// First, convert dA1 to the format needed by the server
+	inputGradients := make([][]float64, inputDim)
+	for i := 0; i < inputDim; i++ {
+		inputGradients[i] = make([]float64, batchSize)
+		for j := 0; j < batchSize; j++ {
+			inputGradients[i][j] = dZ[0][j][i]
 		}
 	}
 
-	for i := 0; i < HiddenDim2; i++ {
-		clientModel.b2[i] -= LearningRate * db2[i]
-	}
+	// Step 7: Pack and encrypt gradients to send back to server
+	// Calculate how many neurons per ciphertext
+	neuronsPerCT := calculateNeuronsPerCT(heContext.params.N()/2, batchSize, 64)
+	numBlocks := (inputDim + neuronsPerCT - 1) / neuronsPerCT
 
-	// ---- New Step 6: pack dA1 into 2 ciphertexts ----      ★ SIMD-weights
-	neurons_per_block = HiddenDim1 / NeuronsPerCT // =2
-	encGradBlk := make([]*rlwe.Ciphertext, neurons_per_block)
+	encGradBlk := make([]*rlwe.Ciphertext, numBlocks)
+	slots := heContext.params.N() / 2
 
-	// Reuse this buffer across iterations - memory optimization
-	scratch := make([]float64, heContext.params.N()/2)
+	// Process each block of neurons
+	for b := 0; b < numBlocks; b++ {
+		// Reuse this buffer across iterations - memory optimization
+		scratch := make([]float64, slots)
 
-	for b := 0; b < neurons_per_block; b++ {
-		// *** clear the buffer – otherwise data from the previous
-		//     block would survive in the tail ***
+		// Pack neurons for this block
+		startNeuron := b * neuronsPerCT
+		endNeuron := min(startNeuron+neuronsPerCT, inputDim)
+
+		// Clear the scratch buffer
 		for i := range scratch {
 			scratch[i] = 0
 		}
 
-		for n := 0; n < NeuronsPerCT; n++ {
-			// We pack the gradient for each neuron across all examples
-			copy(scratch[n*batchSize:(n+1)*batchSize],
-				dA1Transposed[b*NeuronsPerCT+n])
+		// Pack each neuron's gradients for all examples in the batch
+		for n := startNeuron; n < endNeuron; n++ {
+			neuronOffset := (n - startNeuron) * batchSize
+
+			// Copy this neuron's gradients for all examples
+			for i := 0; i < batchSize; i++ {
+				scratch[neuronOffset+i] = inputGradients[n][i]
+			}
 		}
 
+		// Encode
 		pt := ckks.NewPlaintext(heContext.params, heContext.params.MaxLevel())
 		heContext.encoder.Encode(scratch, pt)
 
-		ct, err := heContext.encryptor.EncryptNew(pt)
+		// Encrypt
+		encGrad, err := heContext.encryptor.EncryptNew(pt)
 		if err != nil {
-			return nil, fmt.Errorf("encrypt packed grad: %v", err)
+			return nil, fmt.Errorf("error encrypting gradients: %v", err)
 		}
-		encGradBlk[b] = ct
+
+		encGradBlk[b] = encGrad
 	}
+
 	return encGradBlk, nil
 }
 
-// Server performs backward pass and updates weights
+// PerformEvaluation performs forward pass for evaluation without training
+func PerformEvaluation(heContext *HEContext, clientModel *ClientModel, encActivations []*rlwe.Ciphertext,
+	numImages int) ([]int, [][]float64, error) {
+
+	// Get dimensions from configuration
+	clientLayers := len(clientModel.Weights)
+	if clientLayers == 0 {
+		return nil, nil, fmt.Errorf("client model has no layers")
+	}
+
+	// Input dimension for the client is the output of the server's last layer
+	inputDim := clientModel.GetLayerInputDim(0)
+	numBlocks := len(encActivations)
+	neuronsPerCT := inputDim / numBlocks
+
+	// Step 1: Decrypt the server's encrypted activations
+	a1 := make([][]float64, inputDim)
+
+	for b := 0; b < numBlocks; b++ {
+		// Decrypt the ciphertext for this block
+		pt := heContext.decryptor.DecryptNew(encActivations[b])
+
+		// Decode the plaintext
+		decoded := make([]float64, heContext.params.N()/2)
+		heContext.encoder.Decode(pt, decoded)
+
+		// Extract values for each neuron in this block
+		for n := 0; n < neuronsPerCT; n++ {
+			neuronIdx := b*neuronsPerCT + n
+			if neuronIdx < inputDim {
+				a1[neuronIdx] = make([]float64, numImages)
+				for i := 0; i < numImages; i++ {
+					a1[neuronIdx][i] = decoded[n*numImages+i]
+				}
+			}
+		}
+	}
+
+	// Transpose a1 to have shape [batchSize x inputDim]
+	a1Transposed := make([][]float64, numImages)
+	for i := range a1Transposed {
+		a1Transposed[i] = make([]float64, inputDim)
+		for j := 0; j < inputDim; j++ {
+			a1Transposed[i][j] = a1[j][i]
+		}
+	}
+
+	// Step 2: Forward Pass through Client's Layers
+	// Store activations for each layer (including input)
+	activations := make([][][]float64, clientLayers+1)
+	activations[0] = a1Transposed // Input layer
+
+	// Process each layer
+	for l := 0; l < clientLayers; l++ {
+		inputDim := clientModel.GetLayerInputDim(l)
+		outputDim := clientModel.GetLayerOutputDim(l)
+
+		// Initialize this layer's activations
+		activations[l+1] = make([][]float64, numImages)
+		for i := range activations[l+1] {
+			activations[l+1][i] = make([]float64, outputDim)
+
+			// Compute linear combination: act = prev_act * W + b
+			for j := 0; j < outputDim; j++ {
+				activations[l+1][i][j] = clientModel.Biases[l][j] // Add bias
+
+				for k := 0; k < inputDim; k++ {
+					activations[l+1][i][j] += activations[l][i][k] * clientModel.GetWeight(l, k, j)
+				}
+			}
+
+			// Apply ReLU activation if not the output layer
+			if l < clientLayers-1 {
+				for j := range activations[l+1][i] {
+					if activations[l+1][i][j] < 0 {
+						activations[l+1][i][j] = 0
+					}
+				}
+			}
+		}
+	}
+
+	// Output layer activations
+	outputActivations := activations[clientLayers]
+
+	// Step 3: Compute Predictions
+	predictions := make([]int, numImages)
+	confidences := make([][]float64, numImages)
+
+	for i := 0; i < numImages; i++ {
+		// Apply softmax
+		outputDim := clientModel.GetLayerOutputDim(clientLayers - 1)
+		maxVal := outputActivations[i][0]
+
+		for j := 1; j < outputDim; j++ {
+			if outputActivations[i][j] > maxVal {
+				maxVal = outputActivations[i][j]
+			}
+		}
+
+		expValues := make([]float64, outputDim)
+		expSum := 0.0
+		for j := 0; j < outputDim; j++ {
+			expValues[j] = math.Exp(outputActivations[i][j] - maxVal)
+			expSum += expValues[j]
+		}
+
+		// Find the class with highest probability
+		confidences[i] = make([]float64, outputDim)
+		maxProb := 0.0
+		for j := 0; j < outputDim; j++ {
+			confidences[i][j] = expValues[j] / expSum
+			if confidences[i][j] > maxProb {
+				maxProb = confidences[i][j]
+				predictions[i] = j
+			}
+		}
+	}
+
+	return predictions, confidences, nil
+}
+
+// sumSlotsWithRotations implements efficient summation across slots
+func sumSlotsWithRotations(ctx *HEContext, ct *rlwe.Ciphertext, batchSize int) (*rlwe.Ciphertext, error) {
+	result := ct.CopyNew()
+
+	// Use rotation-and-add technique to sum up values across slots
+	for i := 1; i < batchSize; i *= 2 {
+		rotated := result.CopyNew()
+		if err := ctx.evaluator.Rotate(result, i, rotated); err != nil {
+			return nil, fmt.Errorf("error rotating in innerSum: %v", err)
+		}
+
+		if err := ctx.evaluator.Add(result, rotated, result); err != nil {
+			return nil, fmt.Errorf("error adding in innerSum: %v", err)
+		}
+	}
+
+	return result, nil
+}
+
+// serverBackwardAndUpdate performs the backward pass and updates server model weights
 func serverBackwardAndUpdate(heContext *HEContext, serverModel *ServerModel, encGradients []*rlwe.Ciphertext,
 	cachedInputs []*rlwe.Ciphertext, learningRate float64) error {
-	// Convert the standard server model to a packed homomorphic one
+
+	// Process with the packed update method
+	return packedUpdate(heContext, serverModel, cachedInputs, encGradients, learningRate, BatchSize)
+}
+
+// packedUpdate performs weight updates using packed ciphertexts
+func packedUpdate(heContext *HEContext, serverModel *ServerModel, encInputs []*rlwe.Ciphertext,
+	encGradients []*rlwe.Ciphertext, learningRate float64, batchSize int) error {
+
+	// Create a packed server model for SIMD operations
 	heServer, err := convertToPacked(serverModel, heContext)
 	if err != nil {
-		return fmt.Errorf("failed to convert to packed homomorphic model: %v", err)
+		return fmt.Errorf("failed to convert to packed model: %v", err)
 	}
 
-	fmt.Println("Performing weight update...")
+	// Process only the first (last) layer of the server model
+	// In future versions, this could be extended to all server layers
+	l := len(serverModel.Weights) - 1
+	inputDim := serverModel.GetLayerInputDim(l)
+	outputDim := serverModel.GetLayerOutputDim(l)
 
-	// Use the cached inputs from the forward pass instead of creating placeholders
-	// This is a critical fix - using real inputs for accurate weight updates
+	// Prepare LR plaintext
+	lrPt := scalarPlain(-1.0*learningRate/float64(batchSize), heContext.params, heContext.encoder)
 
-	// Use packedUpdate for SIMD optimization
-	err = packedUpdate(heContext, heServer, cachedInputs, encGradients, learningRate, BatchSize)
-	if err != nil {
-		return fmt.Errorf("homomorphic backward error: %v", err)
+	// Calculate how many neurons per ciphertext
+	neuronsPerCT := heServer.NeuronsPerCT
+	numBlocks := (outputDim + neuronsPerCT - 1) / neuronsPerCT
+
+	// Check if we have the right number of gradient blocks
+	if len(encGradients) != numBlocks {
+		return fmt.Errorf("gradient blocks mismatch: got %d, expected %d", len(encGradients), numBlocks)
 	}
 
-	// For demonstration, decrypt the updated weights
-	blocks_count := HiddenDim1 / NeuronsPerCT
-	for i := 0; i < InputDim; i++ {
-		for b := 0; b < blocks_count; b++ {
-			// Decrypt packed weight
-			ptWeight := heContext.decryptor.DecryptNew(heServer.W[i][b])
-
-			// Decode all slots
-			values := make([]float64, heContext.params.N()/2)
-			heContext.encoder.Decode(ptWeight, values)
-
-			// Extract the weight values (first slot of each batch)
-			for n := 0; n < NeuronsPerCT; n++ {
-				neuronIdx := b*NeuronsPerCT + n
-				if neuronIdx < HiddenDim1 {
-					serverModel.W1[i][neuronIdx] = values[n*BatchSize]
-				}
-			}
-		}
-	}
-
-	// Update biases
-	for b := 0; b < blocks_count; b++ {
-		// Decrypt packed bias
-		ptBias := heContext.decryptor.DecryptNew(heServer.b[b])
-
-		// Decode all slots
-		values := make([]float64, heContext.params.N()/2)
-		heContext.encoder.Decode(ptBias, values)
-
-		// Extract the bias values (first slot of each batch)
-		for n := 0; n < NeuronsPerCT; n++ {
-			neuronIdx := b*NeuronsPerCT + n
-			if neuronIdx < HiddenDim1 {
-				serverModel.b1[neuronIdx] = values[n*BatchSize]
-			}
-		}
-	}
-
-	return nil
-}
-
-// serverBackwardAndUpdateHEParallel updates W1,b1 in-ciphertext using 'workers' goroutines
-func serverBackwardAndUpdateHEParallel(
-	ctx *HEContext,
-	svr *HEServerModel,
-	encX []*rlwe.Ciphertext, // len=inputDim
-	encGradZ []*rlwe.Ciphertext, // len=hiddenDim1
-	lr float64,
-	B int,
-	workers int,
-) error {
-	// Helper to capture first error
-	var firstErr error
-	var errMu sync.Mutex
-	recordErr := func(e error) {
-		errMu.Lock()
-		if firstErr == nil {
-			firstErr = e
-		}
-		errMu.Unlock()
-	}
-
-	if workers < 1 {
-		workers = 1
-	}
-	params := ctx.params
-	etaPt := scalarPlain(-lr/float64(B), params, ctx.encoder)
-
-	rowsPerWkr := (HiddenDim1 + workers - 1) / workers
+	// Process each block of neurons in parallel
 	var wg sync.WaitGroup
+	var errMutex sync.Mutex
+	var packedErr error
 
-	for w := 0; w < workers; w++ {
-		jStart := w * rowsPerWkr
-		jEnd := min(HiddenDim1, jStart+rowsPerWkr)
-		if jStart >= jEnd {
-			continue
-		}
-
-		// each goroutine gets its own evaluator clone (thread-safe)
-		eval := ctx.evaluator.ShallowCopy()
-
+	for b := 0; b < numBlocks; b++ {
 		wg.Add(1)
-		go func(js, je int) {
+		go func(blockIdx int) {
 			defer wg.Done()
-			for j := js; j < je; j++ {
-				// ------- bias update -------
-				sumSlots, e := innerSumSlots(encGradZ[j], B, eval)
-				if e != nil {
-					recordErr(e)
+
+			// For each input dimension
+			for i := 0; i < inputDim; i++ {
+				// 1. Create a copy of the input
+				inputCopy := encInputs[0].CopyNew()
+
+				// 2. Perform inner sum across the batch dimension
+				summedInput, err := sumSlotsWithRotations(heContext, inputCopy, batchSize)
+				if err != nil {
+					errMutex.Lock()
+					packedErr = fmt.Errorf("error in inner sum for block %d: %v", blockIdx, err)
+					errMutex.Unlock()
 					return
 				}
 
-				if e = eval.Mul(sumSlots, etaPt, sumSlots); e != nil {
-					recordErr(e)
+				// 3. Create a copy of the gradient
+				gradCopy := encGradients[blockIdx].CopyNew()
+
+				// 4. Multiply gradient with input
+				if err := heContext.evaluator.Mul(gradCopy, summedInput, gradCopy); err != nil {
+					errMutex.Lock()
+					packedErr = fmt.Errorf("error in gradient-input multiplication for block %d: %v", blockIdx, err)
+					errMutex.Unlock()
 					return
 				}
-				if e = eval.Add(svr.b1[j], sumSlots, svr.b1[j]); e != nil {
-					recordErr(e)
+
+				// 5. Scale by learning rate
+				if err := heContext.evaluator.Mul(gradCopy, lrPt, gradCopy); err != nil {
+					errMutex.Lock()
+					packedErr = fmt.Errorf("error in learning rate scaling for block %d: %v", blockIdx, err)
+					errMutex.Unlock()
 					return
 				}
 
-				// ------- weight updates over inputDim -------
-				for i := 0; i < InputDim; i++ {
-					prod, e := eval.MulNew(encX[i], encGradZ[j])
-					if e != nil {
-						recordErr(e)
-						return
-					}
-					if e = eval.Relinearize(prod, prod); e != nil {
-						recordErr(e)
-						return
-					}
-					if e = eval.Mul(prod, etaPt, prod); e != nil {
-						recordErr(e)
-						return
-					}
-					if e = eval.Add(svr.W1[i][j], prod, svr.W1[i][j]); e != nil {
-						recordErr(e)
-						return
-					}
+				// 6. Add to the weights
+				if err := heContext.evaluator.Add(heServer.W[l][i][blockIdx], gradCopy, heServer.W[l][i][blockIdx]); err != nil {
+					errMutex.Lock()
+					packedErr = fmt.Errorf("error updating weights for block %d: %v", blockIdx, err)
+					errMutex.Unlock()
+					return
 				}
 			}
-		}(jStart, jEnd)
-	}
-	wg.Wait()
-	return firstErr
-}
 
-// packedUpdate applies homomorphic weight updates using the efficient packed SIMD approach
-func packedUpdate(heContext *HEContext, heServer *HEServerPacked, encInputs []*rlwe.Ciphertext, encGradients []*rlwe.Ciphertext, learningRate float64, batchSize int) error {
-	eval := heContext.evaluator
-	// Cache the learning rate constant plain
-	ptLR := scalarPlain(-learningRate/float64(batchSize), heContext.params, heContext.encoder)
+			// Update biases
+			// 1. Create a copy of the gradient
+			gradCopy := encGradients[blockIdx].CopyNew()
 
-	// Cache reusable constants and operations
-	// These don't need to be recalculated for each weight
-	slots := heContext.params.N() / 2
-
-	// Process weights first - use the single packed input to update all weights
-	for i := 0; i < InputDim; i++ {
-		// Get the single packed input
-		encInput := encInputs[0]
-
-		// For each output neuron group (NeuronsPerCT neurons per group)
-		output_blocks := HiddenDim1 / NeuronsPerCT
-		for b := 0; b < output_blocks; b++ {
-			// Create a temporary ciphertext for the gradients
-			tempGrad := encGradients[b].CopyNew()
-
-			// Scale the gradient by -learningRate/batchSize
-			if err := eval.Mul(tempGrad, ptLR, tempGrad); err != nil {
-				return fmt.Errorf("error scaling gradient: %v", err)
-			}
-
-			// Create a temporary ciphertext for the input
-			tempInput := encInput.CopyNew()
-
-			// Multiply the input by the scaled gradient to get the weight update
-			if err := eval.Mul(tempInput, tempGrad, tempInput); err != nil {
-				return fmt.Errorf("error multiplying for weight update: %v", err)
-			}
-
-			// Relinearize the result
-			if err := eval.Relinearize(tempInput, tempInput); err != nil {
-				return fmt.Errorf("error relinearizing weight update: %v", err)
-			}
-
-			// Compute the inner sum to get the weight update
-			weightUpdate, err := innerSumSlots(tempInput, slots, eval)
+			// 2. Sum across batch dimension
+			summedGrad, err := sumSlotsWithRotations(heContext, gradCopy, batchSize)
 			if err != nil {
-				return fmt.Errorf("error computing inner sum: %v", err)
+				errMutex.Lock()
+				packedErr = fmt.Errorf("error in inner sum for biases in block %d: %v", blockIdx, err)
+				errMutex.Unlock()
+				return
 			}
 
-			// Apply the update to the weights
-			if err := eval.Add(heServer.W[i][b], weightUpdate, heServer.W[i][b]); err != nil {
-				return fmt.Errorf("error applying weight update: %v", err)
+			// 3. Scale by learning rate
+			if err := heContext.evaluator.Mul(summedGrad, lrPt, summedGrad); err != nil {
+				errMutex.Lock()
+				packedErr = fmt.Errorf("error in learning rate scaling for biases in block %d: %v", blockIdx, err)
+				errMutex.Unlock()
+				return
 			}
-		}
+
+			// 4. Add to the biases
+			if err := heContext.evaluator.Add(heServer.b[l][blockIdx], summedGrad, heServer.b[l][blockIdx]); err != nil {
+				errMutex.Lock()
+				packedErr = fmt.Errorf("error updating biases for block %d: %v", blockIdx, err)
+				errMutex.Unlock()
+				return
+			}
+		}(b)
 	}
 
-	// Update biases using the gradient directly
-	bias_blocks := HiddenDim1 / NeuronsPerCT
-	for b := 0; b < bias_blocks; b++ {
-		// Create a temporary ciphertext for the bias update
-		tempBias := encGradients[b].CopyNew()
+	wg.Wait()
 
-		// Scale the gradient by -learningRate/batchSize
-		if err := eval.Mul(tempBias, ptLR, tempBias); err != nil {
-			return fmt.Errorf("error scaling bias gradient: %v", err)
-		}
-
-		// Compute the inner sum to get the bias update
-		biasUpdate, err := innerSumSlots(tempBias, slots, eval)
-		if err != nil {
-			return fmt.Errorf("error computing inner sum for bias: %v", err)
-		}
-
-		// Apply the update to the biases
-		if err := eval.Add(heServer.b[b], biasUpdate, heServer.b[b]); err != nil {
-			return fmt.Errorf("error applying bias update: %v", err)
-		}
+	if packedErr != nil {
+		return packedErr
 	}
+
+	// Update the plaintext model from the homomorphic model
+	// This is necessary because we need to pass the updated weights back to the caller
+	updateModelFromHE(heContext, serverModel, heServer, l, batchSize)
 
 	return nil
+}
+
+// updateModelFromHE updates the plaintext server model from the homomorphic model
+func updateModelFromHE(heContext *HEContext, serverModel *ServerModel, heServer *HEServerPacked, layer int, batchSize int) {
+	outputDim := serverModel.GetLayerOutputDim(layer)
+	inputDim := serverModel.GetLayerInputDim(layer)
+	neuronsPerCT := heServer.NeuronsPerCT
+	numBlocks := (outputDim + neuronsPerCT - 1) / neuronsPerCT
+
+	// For each block of neurons
+	for b := 0; b < numBlocks; b++ {
+		// Get the neurons in this block
+		startNeuron := b * neuronsPerCT
+		endNeuron := min(startNeuron+neuronsPerCT, outputDim)
+
+		// For each input dimension
+		for i := 0; i < inputDim; i++ {
+			// Decrypt the weights
+			pt := heContext.decryptor.DecryptNew(heServer.W[layer][i][b])
+
+			// Decode
+			values := make([]float64, heContext.params.N()/2)
+			heContext.encoder.Decode(pt, values)
+
+			// Update the server model weights
+			for n := startNeuron; n < endNeuron; n++ {
+				if n < outputDim {
+					newWeight := values[(n-startNeuron)*batchSize]
+					serverModel.SetWeight(layer, i, n, newWeight)
+				}
+			}
+		}
+
+		// Decrypt the biases
+		pt := heContext.decryptor.DecryptNew(heServer.b[layer][b])
+
+		// Decode
+		values := make([]float64, heContext.params.N()/2)
+		heContext.encoder.Decode(pt, values)
+
+		// Update the server model biases
+		for n := startNeuron; n < endNeuron; n++ {
+			if n < outputDim {
+				serverModel.Biases[layer][n] = values[(n-startNeuron)*batchSize]
+			}
+		}
+	}
 }
