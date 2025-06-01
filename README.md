@@ -1,87 +1,146 @@
-# CURE_lib: Configurable Split Learning with Homomorphic Encryption
+# CURE\_lib: Homomorphic Split Learning for MLPs
 
-CURE_lib is a Go library for implementing privacy-preserving split learning with homomorphic encryption. The library enables training neural networks where part of the computation is performed on encrypted data, preserving privacy while still enabling effective training.
+**CURE\_lib** provides a Go implementation of split learning for MLPs using CKKS homomorphic encryption (via Lattigo v6). You define an arbitrary MLP, split it into “server” and “client” segments, and train securely: the client encrypts its cut-layer activations in SIMD-packed ciphertexts, the server continues forward/backward under HE, updates its encrypted weights, then returns encrypted gradients. At inference you can either run a small batch or pack one image per ciphertext.
+
+---
 
 ## Key Features
 
-### Configurable Network Architecture
+* **Configurable Architecture** via JSON `ModelConfig` (e.g. `{"arch":[784,128,32,10],"splitIdx":1}`).
 
-- **Arbitrary Network Depth**: Support for an arbitrary number of layers on both server and client sides
-- **Flexible Split Point**: Ability to configure where the network is split between server and client
-- **Full Backpropagation**: Complete backward pass through all server layers with proper gradient propagation
+* **Three Training Modes**:
 
-### Homomorphic Encryption Integration
+  1. **Standard Split-HE**: server decrypts intermediate weights each batch.
+  2. **Fully HE**: server keeps weights encrypted throughout and only decrypts once at the end.
+  3. **SIMD-Packed**: server maintains a packed-HE model and updates just the final layer under HE each batch.
 
-- **CKKS Scheme**: Uses the Lattigo CKKS scheme for approximate homomorphic encryption
-- **SIMD Operations**: Efficiently packs multiple values into ciphertext slots for parallel processing
-- **Optimized HE Operations**: Minimizes the number of expensive operations while maintaining security
+* **Two Inference Options**:
 
-## Implementation Details
+  * **SIMD-Batch** (default): pack each image into one ciphertext.
+  * **Single-Ciphertext** (requires minor additions): pack all 784 pixels of one image into one ciphertext.
 
-### Multi-Layer Server Processing
+* **MNIST Example** built-in: loading, training, saving/loading models, and evaluation.
 
-The implementation supports configurable neural networks with:
+---
 
-1. **Multiple Server Layers**: 
-   - Each server layer processes encrypted inputs homomorphically
-   - All intermediate activations are cached for backward pass
+## Directory Overview
 
-2. **Backward Pass Through Server Layers**:
-   - Computes and applies weight/bias updates in the encrypted domain
-   - Propagates gradients backward through all server layers
-   - Uses ReLU derivative approximation for non-linear activations
-
-3. **Parallelized Processing**:
-   - Uses goroutines for parallel processing of neurons and examples
-   - SIMD packing for processing multiple samples simultaneously
-
-### Client-Side Processing
-
-1. **Client Forward Pass**:
-   - Decrypts server outputs
-   - Performs forward pass through client layers
-   - Computes loss and final outputs
-
-2. **Client Backward Pass**:
-   - Computes gradients for client weights and biases
-   - Updates client model parameters
-   - Prepares encrypted gradients to send back to server
-
-## Performance
-
-- Training a model with architecture [784-128-64-32-10] where the server has 3 layers (784→128→64→32) and the client has 1 layer (32→10)
-- Processing time for a batch of 4 examples:
-  - Encryption: ~3.6s
-  - Server forward pass: ~75s
-  - Client computation: ~10ms
-  - Server backward pass: ~28s
-
-## Usage Example
-
-```go
-// Create model configuration with configurable architecture
-config := &split.ModelConfig{
-    Arch:     []int{784, 128, 64, 32, 10}, // Architecture with 3 server layers
-    SplitIdx: 3,                            // Server has 3 layers (784->128->64->32), client has 1 (32->10)
-}
-
-// Initialize client and server models
-clientModel := split.InitClientModel(config)
-serverModel := split.InitServerModel(config)
-
-// Forward pass with layer input caching
-layerInputs, encActivations, err := split.ServerForwardPassWithLayerInputs(heContext, serverModel, encPixels)
-
-// Client forward and backward pass
-encGradients, err := split.ClientForwardAndBackward(heContext, clientModel, encActivations, labels, batchIndices)
-
-// Server backward pass with multi-layer gradient propagation
-err = split.ServerBackwardAndUpdate(heContext, serverModel, encGradients, layerInputs, learningRate)
+```
+split/
+├── he_context.go       # CKKS parameters, keys, HEContext
+├── models.go           # ClientModel, ServerModel, HEServerModel, HEServerPacked
+├── client_forward.go   # clientPrepareAndEncryptBatch, PerformEvaluation
+├── client_backward.go  # clientForwardAndBackward (plaintext forward/backward + gradient packing)
+├── server_forward.go   # serverForwardPass, serverForwardPassPacked
+├── server_backward.go  # serverBackwardAndUpdate, packedUpdateDirect
+├── train.go            # Run, trainModelWithBatches, trainBatchWithTiming, trainModelFullSIMD
+├── eval.go             # evaluateModel, EvaluateModelOnBatch
+├── save_load.go        # saveModel, loadModel
+├── config.go           # ModelConfig, RunConfig, flag parsing
+├── helpers.go          # innerSumSlots, scalarPlain, parallelFor, etc.
+├── data_io.go          # readMNISTData, readMNISTImages, readMNISTLabels
+└── split_test.go       # unit tests
 ```
 
-## Future Work
+---
 
-- Implement support for convolutional layers
-- Add checkpointing for long-running training processes
-- Optimize homomorphic operations for faster training
-- Add support for different activation functions
+## Quick Start
+
+1. **Prerequisites**
+
+   * Go 1.18+
+   * Internet (to fetch Lattigo v6 and MNIST)
+   * \~100 MB free disk space
+
+2. **Get MNIST**
+
+   ```bash
+   cd split
+   go generate
+   ```
+
+3. **Build**
+
+   ```bash
+   cd ..
+   go mod tidy
+   go build ./split
+   ```
+
+4. **Train**
+
+   ```bash
+   ./split \
+     -mode=train \
+     -batchSize=8 \
+     -numBatches=100 \
+     -fullyHE=false \
+     -fullySIMD=false \
+     -clientModel=client.bin \
+     -serverModel=server.bin \
+     -modelConfig='{"arch":[784,128,32,10],"splitIdx":1}'
+   ```
+
+5. **Evaluate**
+
+   ```bash
+   ./split \
+     -mode=eval \
+     -clientModel=client.bin \
+     -serverModel=server.bin \
+     -modelConfig='{"arch":[784,128,32,10],"splitIdx":1}'
+   ```
+
+---
+
+## Usage Summary
+
+1. **HE Setup** (`he_context.go`):
+   Builds CKKS with default parameters (N=8192, depth≈6).
+
+2. **Model Init** (`models.go`):
+
+   * `initClientModel(config)` and `initServerModel(config)` to create random weights.
+   * `convertToPacked(...)` if running SIMD-packed or fully HE.
+
+3. **Client Side**:
+
+   * **Encrypt & Pack** (`clientPrepareAndEncryptBatch`): one ciphertext per image.
+   * **Plaintext Forward/Backward** (`clientForwardAndBackward`): decrypt server activations, do ReLU/softmax, compute gradients, repack into HE ciphertexts.
+
+4. **Server Side**:
+
+   * **Forward** (`serverForwardPass`): multiply/add encrypted activations with plaintext weights, apply HE-ReLU.
+   * **Backward & Update** (`serverBackwardAndUpdate`): decrypt gradients, update plaintext weights (or under HE if fullyHE), and optionally decrypt updated weights.
+   * **SIMD-Packed Option** (`serverForwardPassPacked` + `packedUpdateDirect`): maintain a packed HE model and update only the final layer under HE per batch; decrypt everything at end.
+
+5. **Saving/Loading** (`save_load.go`):
+   Save plaintext weights/biases to files, and load them back.
+
+6. **Evaluation** (`eval.go`):
+   For each test sample (batchSize=1), encrypt → server forward → decrypt → client forward → softmax.
+
+---
+
+## Testing
+
+Run all tests:
+
+```bash
+go test ./split -timeout 30s
+```
+
+---
+
+## Configuration
+
+* **Network**: specify `arch` (layer dims) and `splitIdx` (0 ≤ splitIdx ≤ len(arch)−2).
+* **BatchSize** and **NumBatches**: control how many samples per batch and how many batches to train.
+* **LearningRate** and **Epochs**: set in `config.go`.
+* **HE Params**: edit `LogN`, `LogQ`, `LogP`, and `LogDefaultScale` in `he_context.go` if you need deeper networks or fewer slots.
+
+---
+
+## License
+
+MIT License. Contributions welcome!
