@@ -7,7 +7,7 @@ import (
 )
 
 // DataPath represents the path to the MNIST data files
-var DataPath = "./data"
+var DataPath = "/Users/halilibrahimkanpak/Documents/Coding/CURE_lib/data"
 
 //go:generate bash -c "mkdir -p ./data && cd ./data && curl -O http://yann.lecun.com/exdb/mnist/train-images-idx3-ubyte.gz && curl -O http://yann.lecun.com/exdb/mnist/train-labels-idx1-ubyte.gz && curl -O http://yann.lecun.com/exdb/mnist/t10k-images-idx3-ubyte.gz && curl -O http://yann.lecun.com/exdb/mnist/t10k-labels-idx1-ubyte.gz && gzip -d *.gz || true"
 

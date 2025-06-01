@@ -20,14 +20,44 @@ type HEContext struct {
 	rtks      []*rlwe.GaloisKey // Rotation keys
 }
 
+// GetParams returns the CKKS parameters
+func (he *HEContext) GetParams() ckks.Parameters {
+	return he.params
+}
+
+// GetEncoder returns the CKKS encoder
+func (he *HEContext) GetEncoder() *ckks.Encoder {
+	return he.encoder
+}
+
+// GetEncryptor returns the RLWE encryptor
+func (he *HEContext) GetEncryptor() *rlwe.Encryptor {
+	return he.encryptor
+}
+
+// GetDecryptor returns the RLWE decryptor
+func (he *HEContext) GetDecryptor() *rlwe.Decryptor {
+	return he.decryptor
+}
+
+// GetEvaluator returns the CKKS evaluator
+func (he *HEContext) GetEvaluator() *ckks.Evaluator {
+	return he.evaluator
+}
+
+// GetSlots returns the number of slots available in the scheme
+func (he *HEContext) GetSlots() int {
+	return he.params.N() / 2
+}
+
 // Initialize HE parameters and generate keys
 func initHE() (*HEContext, error) {
-	// Use simple parameters with enough multiplicative depth for our operations
+	// Use parameters with enough multiplicative depth for our configurable networks
 	paramsLiteral := ckks.ParametersLiteral{
-		LogN:            12,                    // Ring degree: 2^12 = 4096 (smaller for faster testing)
-		LogQ:            []int{40, 40, 40, 40}, // More conservative parameters
-		LogP:            []int{45, 45},         // Special modulus for key switching
-		LogDefaultScale: 30,                    // Scale 2^30
+		LogN:            13,                                // Ring degree: 2^13 = 8192 (higher for deeper networks)
+		LogQ:            []int{55, 50, 50, 50, 50, 50, 50}, // More levels for multi-layer operations
+		LogP:            []int{60, 60},                     // Special modulus for key switching
+		LogDefaultScale: 40,                                // Higher scale for better precision
 	}
 
 	// Create parameters from literal
@@ -45,7 +75,7 @@ func initHE() (*HEContext, error) {
 	rlk := kgen.GenRelinearizationKeyNew(sk)
 
 	// --- rotations we need (powers of two up to slots/2) ---
-	rotations := []int{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}
+	rotations := []int{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}
 
 	// Generate rotation keys for all needed rotations
 	var rotKeys []*rlwe.GaloisKey

@@ -14,68 +14,64 @@ func min(a, b int) int {
 }
 
 // innerSumSlots returns a ciphertext that contains the slot-sum of ct
-// replicated in every slot. Needs Pow-2 rotation keys.
+// replicated in every slot. Uses Lattigo's more efficient InnerSum
+// which provides an O(log n) tree reduction rather than linear rotations.
 func innerSumSlots(ct *rlwe.Ciphertext, slots int, evaluator *ckks.Evaluator) (*rlwe.Ciphertext, error) {
+	// Use Lattigo's optimized InnerSum for O(log n) reduction
+	// This creates rotations in a tree pattern rather than linearly
 	res := ct.CopyNew()
-	tmp := ct.CopyNew()
-
-	// log₂(slots) rotations/additions
-	for k := 1; k < slots; k <<= 1 {
-		if err := evaluator.Rotate(res, k, tmp); err != nil {
-			return nil, err
-		}
-		if err := evaluator.Add(res, tmp, res); err != nil {
-			return nil, err
-		}
+	if err := evaluator.InnerSum(res, 1, slots, res); err != nil {
+		return nil, err
 	}
 	return res, nil
 }
 
-// scalarPlain encodes a constant replicated in every slot.
-func scalarPlain(val float64, params ckks.Parameters, encoder *ckks.Encoder) *rlwe.Plaintext {
+// scalarPlain creates a plaintext with all slots set to the same value
+func scalarPlain(value float64, params ckks.Parameters, encoder *ckks.Encoder) *rlwe.Plaintext {
 	pt := ckks.NewPlaintext(params, params.MaxLevel())
-	v := make([]float64, params.N()/2) // Number of slots is N/2 for CKKS
-	for i := range v {
-		v[i] = val
+
+	// Create a vector with all slots having the same value
+	vec := make([]float64, params.N()/2)
+	for i := range vec {
+		vec[i] = value
 	}
-	encoder.Encode(v, pt)
+
+	// Encode the vector
+	encoder.Encode(vec, pt)
+
 	return pt
 }
 
-// repeat(x, k) returns slice {x,x,…} (len=k)
-func repeat(x float64, k int) []float64 {
-	v := make([]float64, k)
-	for i := range v {
-		v[i] = x
+// repeat creates a slice with a value repeated n times
+func repeat(value float64, n int) []float64 {
+	result := make([]float64, n)
+	for i := range result {
+		result[i] = value
 	}
-	return v
+	return result
 }
 
-// chunkSum reduces the B slots that belong to each neuron
-// (i.e. slots [k*B : k*B+B-1]) and replicates that sum on
-// **every** slot of the same chunk.
-func chunkSum(ct *rlwe.Ciphertext, B int, ev *ckks.Evaluator) (*rlwe.Ciphertext, error) {
-	res := ct.CopyNew()
-	tmp := ct.CopyNew()
+// maskFirst creates a plaintext mask that keeps only the first few slots
+// and zeros out the rest. This is useful for extracting just the first value
+// from batch operations.
+func maskFirst(params ckks.Parameters, encoder *ckks.Encoder, batchSize int) *rlwe.Plaintext {
+	pt := ckks.NewPlaintext(params, params.MaxLevel())
 
-	for k := 1; k < B; k <<= 1 { // log2(B) rotations
-		if err := ev.Rotate(res, k, tmp); err != nil {
-			return nil, err
-		}
-		if err := ev.Add(res, tmp, res); err != nil {
-			return nil, err
-		}
+	// Create a vector with 1s for the first batchSize slots and 0s elsewhere
+	vec := make([]float64, params.N()/2)
+	for i := 0; i < batchSize && i < len(vec); i++ {
+		vec[i] = 1.0
 	}
-	return res, nil
-}
 
-// maskFirst() → 1,0,…,0 every B slots (keeps slot-0 of each chunk)
-func maskFirst(p ckks.Parameters, enc *ckks.Encoder, B int) *rlwe.Plaintext {
-	v := make([]float64, p.N()/2)
-	for i := 0; i < len(v); i += B {
-		v[i] = 1
-	}
-	pt := ckks.NewPlaintext(p, p.MaxLevel())
-	enc.Encode(v, pt)
+	// Encode the vector
+	encoder.Encode(vec, pt)
+
 	return pt
+}
+
+// chunkSum computes the sum across slots within specified chunks
+// For example, it can sum across batch elements for each neuron
+func chunkSum(ct *rlwe.Ciphertext, chunkSize int, evaluator *ckks.Evaluator) (*rlwe.Ciphertext, error) {
+	// Use innerSumSlots for the efficient implementation
+	return innerSumSlots(ct, chunkSize, evaluator)
 }

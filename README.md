@@ -1,96 +1,87 @@
-# Split Learning with Homomorphic Encryption
+# CURE_lib: Configurable Split Learning with Homomorphic Encryption
 
-This project demonstrates a split learning approach for neural networks using homomorphic encryption with the CKKS scheme.
+CURE_lib is a Go library for implementing privacy-preserving split learning with homomorphic encryption. The library enables training neural networks where part of the computation is performed on encrypted data, preserving privacy while still enabling effective training.
 
-## Project Structure
+## Key Features
 
-```
-.
-├── cmd/
-│   └── split_training_demo/
-│       └── main.go        ← CLI handling
-└── split_training/
-    ├── data.go            ← MNIST I/O
-    ├── params.go          ← Constants & global flags
-    ├── hecontext.go       ← HE context initialization
-    ├── models.go          ← Model structures
-    ├── utils.go           ← Helper functions
-    ├── forward.go         ← Forward pass
-    ├── backward.go        ← Backward pass
-    ├── training.go        ← Training loops
-    └── evaluation.go      ← Model evaluation
-```
+### Configurable Network Architecture
 
-## Prerequisites
+- **Arbitrary Network Depth**: Support for an arbitrary number of layers on both server and client sides
+- **Flexible Split Point**: Ability to configure where the network is split between server and client
+- **Full Backpropagation**: Complete backward pass through all server layers with proper gradient propagation
 
-- Go 1.18 or later
-- MNIST dataset (will be downloaded automatically with `go generate`)
+### Homomorphic Encryption Integration
 
-## Building and Running
+- **CKKS Scheme**: Uses the Lattigo CKKS scheme for approximate homomorphic encryption
+- **SIMD Operations**: Efficiently packs multiple values into ciphertext slots for parallel processing
+- **Optimized HE Operations**: Minimizes the number of expensive operations while maintaining security
 
-### Downloading MNIST Data
+## Implementation Details
 
-To download the MNIST dataset:
+### Multi-Layer Server Processing
 
-```bash
-cd split_training
-go generate
-```
+The implementation supports configurable neural networks with:
 
-### Training a Model
+1. **Multiple Server Layers**: 
+   - Each server layer processes encrypted inputs homomorphically
+   - All intermediate activations are cached for backward pass
 
-To train a new model with default settings:
+2. **Backward Pass Through Server Layers**:
+   - Computes and applies weight/bias updates in the encrypted domain
+   - Propagates gradients backward through all server layers
+   - Uses ReLU derivative approximation for non-linear activations
 
-```bash
-make run
-```
+3. **Parallelized Processing**:
+   - Uses goroutines for parallel processing of neurons and examples
+   - SIMD packing for processing multiple samples simultaneously
 
-Or manually:
+### Client-Side Processing
 
-```bash
-go run ./cmd/split_training_demo train
-```
+1. **Client Forward Pass**:
+   - Decrypts server outputs
+   - Performs forward pass through client layers
+   - Computes loss and final outputs
 
-Training with fully homomorphic backpropagation (slower but more secure):
+2. **Client Backward Pass**:
+   - Computes gradients for client weights and biases
+   - Updates client model parameters
+   - Prepares encrypted gradients to send back to server
 
-```bash
-make train-full-he
-```
+## Performance
 
-Or manually:
+- Training a model with architecture [784-128-64-32-10] where the server has 3 layers (784→128→64→32) and the client has 1 layer (32→10)
+- Processing time for a batch of 4 examples:
+  - Encryption: ~3.6s
+  - Server forward pass: ~75s
+  - Client computation: ~10ms
+  - Server backward pass: ~28s
 
-```bash
-go run ./cmd/split_training_demo train --he --batches 10
-```
+## Usage Example
 
-### Evaluating a Model
+```go
+// Create model configuration with configurable architecture
+config := &split.ModelConfig{
+    Arch:     []int{784, 128, 64, 32, 10}, // Architecture with 3 server layers
+    SplitIdx: 3,                            // Server has 3 layers (784->128->64->32), client has 1 (32->10)
+}
 
-To evaluate a previously trained model:
+// Initialize client and server models
+clientModel := split.InitClientModel(config)
+serverModel := split.InitServerModel(config)
 
-```bash
-make eval
-```
+// Forward pass with layer input caching
+layerInputs, encActivations, err := split.ServerForwardPassWithLayerInputs(heContext, serverModel, encPixels)
 
-Or manually:
+// Client forward and backward pass
+encGradients, err := split.ClientForwardAndBackward(heContext, clientModel, encActivations, labels, batchIndices)
 
-```bash
-go run ./cmd/split_training_demo eval client_model.txt server_model.txt
-```
-
-### Advanced Options
-
-```
-go run ./cmd/split_training_demo train [options]
-  --batches <num>     - Train with specified number of batches
-  --he                - Use fully homomorphic backpropagation
-  --save              - Save trained models
-  --client <path>     - Client model filename
-  --server <path>     - Server model filename
-  --batch <size>      - Mini-batch size (<= CKKS slots)
+// Server backward pass with multi-layer gradient propagation
+err = split.ServerBackwardAndUpdate(heContext, serverModel, encGradients, layerInputs, learningRate)
 ```
 
-## Cleaning Up
+## Future Work
 
-```bash
-make clean
-```
+- Implement support for convolutional layers
+- Add checkpointing for long-running training processes
+- Optimize homomorphic operations for faster training
+- Add support for different activation functions
