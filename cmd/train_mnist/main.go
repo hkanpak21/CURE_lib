@@ -57,7 +57,7 @@ func main() {
 	// Instead of loading real MNIST data, we'll create synthetic data for demonstration
 
 	// Create synthetic data (784 pixels per image)
-	totalSamples := 64
+	totalSamples := 1024
 	trainImages := make([][]float64, totalSamples)
 	trainLabels := make([]int, totalSamples)
 
@@ -105,7 +105,7 @@ func main() {
 	}
 
 	// Prepare a small batch of data
-	batchSize := 8 // Use 8 examples to better demonstrate batch processing
+	batchSize := 1024 // Use 1024 examples to better demonstrate batch processing
 	numBatches := 1
 	epochs := 1
 
