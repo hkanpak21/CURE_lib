@@ -1,0 +1,14 @@
+=== RUN   TestConvertToPackedAndBack
+--- PASS: TestConvertToPackedAndBack (15.76s)
+=== RUN   TestServerForwardPassSingleLayerPacked
+--- PASS: TestServerForwardPassSingleLayerPacked (16.11s)
+=== RUN   TestPackedUpdateDirectSingleLayer
+--- PASS: TestPackedUpdateDirectSingleLayer (17.36s)
+=== RUN   TestServerBackwardAndUpdateSingleLayer
+    ops_server_test.go:461: W[0][0][0] should increase from 0.100000, but got -1998971199302873749281113658052226766364920186625344449559358603264.000000 (negative change or no change)
+    ops_server_test.go:471: W[0][1][0] should increase from 0.200000, but got -1998971199302873749281113658052226766364920186625344449559358603264.000000 (negative change or no change)
+    ops_server_test.go:484: B[0][0] increased as expected: 0.010000 -> 0.060000
+--- FAIL: TestServerBackwardAndUpdateSingleLayer (16.18s)
+FAIL
+exit status 1
+FAIL	github.com/halilibrahimkanpak/cure_test/split_training	65.692s

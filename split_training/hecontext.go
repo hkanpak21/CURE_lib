@@ -9,15 +9,16 @@ import (
 
 // HEContext holds all the necessary objects for homomorphic encryption
 type HEContext struct {
-	params    ckks.Parameters
-	encoder   *ckks.Encoder
-	encryptor *rlwe.Encryptor
-	decryptor *rlwe.Decryptor
-	evaluator *ckks.Evaluator
-	sk        *rlwe.SecretKey
-	pk        *rlwe.PublicKey
-	rlk       *rlwe.RelinearizationKey
-	rtks      []*rlwe.GaloisKey // Rotation keys
+	params      ckks.Parameters
+	encoder     *ckks.Encoder
+	encryptor   *rlwe.Encryptor
+	decryptor   *rlwe.Decryptor
+	evaluator   *ckks.Evaluator
+	sk          *rlwe.SecretKey
+	pk          *rlwe.PublicKey
+	rlk         *rlwe.RelinearizationKey
+	rtks        []*rlwe.GaloisKey // Rotation keys
+	slotMaskPTs []*rlwe.Plaintext // Precomputed slot mask plaintexts
 }
 
 // GetParams returns the CKKS parameters
@@ -50,6 +51,14 @@ func (he *HEContext) GetSlots() int {
 	return he.params.N() / 2
 }
 
+// GetSlotMaskPT returns a precomputed plaintext with slot 'slotIndex' set to 1.0 and others to 0.
+func (he *HEContext) GetSlotMaskPT(slotIndex int) (*rlwe.Plaintext, error) {
+	if slotIndex < 0 || slotIndex >= len(he.slotMaskPTs) {
+		return nil, fmt.Errorf("slotIndex %d out of bounds for precomputed masks (max: %d)", slotIndex, len(he.slotMaskPTs)-1)
+	}
+	return he.slotMaskPTs[slotIndex], nil
+}
+
 // Initialize HE parameters and generate keys
 func initHE() (*HEContext, error) {
 	// Use parameters with enough multiplicative depth for our configurable networks
@@ -65,6 +74,9 @@ func initHE() (*HEContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating CKKS parameters: %v", err)
 	}
+
+	// Initialize global pools with the created parameters
+	InitGlobalPools(params)
 
 	// Generate keys
 	kgen := rlwe.NewKeyGenerator(params)
@@ -85,18 +97,39 @@ func initHE() (*HEContext, error) {
 		rotKeys = append(rotKeys, rotKey)
 	}
 
+	// Create encoder for slot mask plaintexts
+	encoder := ckks.NewEncoder(params)
+
+	// Precompute slot mask plaintexts
+	slots := params.N() / 2
+	slotMaskPlaintexts := make([]*rlwe.Plaintext, slots)
+	maskBuf := make([]float64, slots) // Temporary buffer for creating masks
+	for i := 0; i < slots; i++ {
+		// Clear buffer for each mask
+		for k := range maskBuf {
+			maskBuf[k] = 0.0
+		}
+		maskBuf[i] = 1.0
+		pt := ckks.NewPlaintext(params, params.MaxLevel())
+		if err := encoder.Encode(maskBuf, pt); err != nil {
+			return nil, fmt.Errorf("error encoding slot mask for index %d: %v", i, err)
+		}
+		slotMaskPlaintexts[i] = pt
+	}
+
 	// Collect everything in a single EvaluationKey set
 	evk := rlwe.NewMemEvaluationKeySet(rlk, rotKeys...)
 
 	return &HEContext{
-		params:    params,
-		encoder:   ckks.NewEncoder(params),
-		encryptor: rlwe.NewEncryptor(params, pk),
-		decryptor: rlwe.NewDecryptor(params, sk),
-		evaluator: ckks.NewEvaluator(params, evk),
-		sk:        sk,
-		pk:        pk,
-		rlk:       rlk,
-		rtks:      rotKeys,
+		params:      params,
+		encoder:     encoder,
+		encryptor:   rlwe.NewEncryptor(params, pk),
+		decryptor:   rlwe.NewDecryptor(params, sk),
+		evaluator:   ckks.NewEvaluator(params, evk),
+		sk:          sk,
+		pk:          pk,
+		rlk:         rlk,
+		rtks:        rotKeys,
+		slotMaskPTs: slotMaskPlaintexts,
 	}, nil
 }
